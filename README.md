@@ -139,6 +139,7 @@ Hosts own these policies. Do not use the package as a sandbox against untrusted 
 See [development instructions](docs/DEVELOPMENT.md), [domain language](GLOSSARY.md),
 [PostgreSQL integration](docs/POSTGRES.md) and [Qdrant integration](docs/QDRANT.md).
 CI targets Python 3.12 and 3.14 with real PostgreSQL and local-mode Qdrant tests.
+See [the validation record](docs/VALIDATION.md) for executed gates, review closure and limitations.
 This repository does not claim verified integration with Impulsira or ServexaOS.
 
 ## License
