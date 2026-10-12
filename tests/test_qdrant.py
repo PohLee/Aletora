@@ -1,11 +1,24 @@
 import math
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 import pytest
 from qdrant_client import AsyncQdrantClient, models
 
+from aletora.adapters.memory import InMemoryDatabase, InMemoryEventSink, InMemoryRecordStore
 from aletora.adapters.qdrant import QdrantIndex
-from aletora.models import EmbeddingProfile, Scope
+from aletora.memory import Memory
+from aletora.models import (
+    EmbeddingProfile,
+    EpistemicKind,
+    FormalRef,
+    GovernanceState,
+    Proposal,
+    ResolvedRecord,
+    Scope,
+    SourceKind,
+    SourceRef,
+)
 
 
 @pytest.fixture
@@ -63,7 +76,7 @@ async def test_upsert_is_repeatable_and_rebuild_delete_are_scope_isolated(qdrant
     await index.upsert(same_scope, "same-id", 2, [0.0, 1.0, 0.0], evidence_id="e2")
     await index.upsert(other_namespace, "same-id", 1, [1.0, 0.0, 0.0], evidence_id="e1")
     await index.upsert(other_tenant, "same-id", 1, [1.0, 0.0, 0.0], evidence_id="e1")
-    await index.delete(same_scope, "same-id")
+    await index.delete(same_scope, "same-id", 2)
 
     assert await index.search(same_scope, "query", limit=5, offset=0) == ()
     assert len(await index.search(other_namespace, "query", limit=5, offset=0)) == 1
@@ -83,6 +96,95 @@ async def test_retry_from_a_rebuilt_adapter_replaces_the_same_projection(qdrant)
     assert [(hit.candidate_id, hit.revision) for hit in hits] == [("candidate", 2)]
 
 
+async def test_late_old_upsert_and_delete_cannot_replace_or_remove_newer_revision(qdrant):
+    index = await make_index(qdrant)
+    scope = Scope("tenant", "main")
+    await index.upsert(scope, "candidate", 2, [0, 1, 0])
+    await index.upsert(scope, "candidate", 1, [1, 0, 0])
+
+    hits = await index.search(scope, "query", limit=10, offset=0)
+    assert {(hit.candidate_id, hit.revision) for hit in hits} == {
+        ("candidate", 1),
+        ("candidate", 2),
+    }
+    await index.delete(scope, "candidate", 1)
+    hits = await index.search(scope, "query", limit=10, offset=0)
+    assert [(hit.candidate_id, hit.revision) for hit in hits] == [("candidate", 2)]
+
+    await index.delete(scope, "candidate", 2)
+    assert await index.search(scope, "query", limit=10, offset=0) == ()
+
+
+async def test_stale_projection_does_not_hide_current_candidate_from_memory(qdrant):
+    now = datetime(2026, 10, 13, tzinfo=timezone.utc)
+    scope = Scope("tenant", "main")
+    embedding_profile = profile()
+    index = await make_index(qdrant, vector=[1, 0, 0])
+    database = InMemoryDatabase()
+    store = InMemoryRecordStore(database)
+    sink = InMemoryEventSink(database)
+    lifecycle = Memory(store, sink, clock=lambda: now)
+    async with database.transaction():
+        evidence = await lifecycle.record_evidence(
+            scope,
+            SourceRef(SourceKind.DOCUMENT, "doc-1", "v1", "section:1"),
+            "evidence text",
+            idempotency_key="evidence-1",
+            captured_at=now,
+        )
+        proposed = await lifecycle.propose(
+            scope,
+            evidence.id,
+            Proposal(
+                "candidate text",
+                EpistemicKind.ASSERTED,
+                "author",
+                "extractor",
+                "run-1",
+                now,
+            ),
+            idempotency_key="candidate-1",
+        )
+        accepted = await lifecycle.review(
+            scope,
+            proposed.id,
+            GovernanceState.ACCEPTED,
+            "reviewer",
+            "approved",
+            expected_revision=proposed.revision,
+        )
+        ref = FormalRef("host", "Policy", "policy-1", "v-current")
+        applied = await lifecycle.record_application(
+            scope, accepted.id, ref, "host", expected_revision=accepted.revision
+        )
+
+    await index.upsert(scope, applied.id, applied.revision, [0, 1, 0], evidence_id=evidence.id)
+    await index.upsert(scope, applied.id, applied.revision - 1, [1, 0, 0], evidence_id=evidence.id)
+
+    class AuthorizedResolver:
+        async def resolve(self, request_scope, request_ref):
+            assert request_scope == scope
+            if request_ref == ref:
+                return ResolvedRecord(ref, "current authorized policy")
+            return None
+
+    retrieval = Memory(
+        store,
+        sink,
+        index=index,
+        resolver=AuthorizedResolver(),
+        profile=embedding_profile,
+        clock=lambda: now,
+    )
+    async with database.transaction():
+        hits = await retrieval.retrieve(scope, "query", limit=1)
+
+    assert len(hits) == 1
+    assert hits[0].revision == applied.revision
+    assert hits[0].ref == ref
+    assert hits[0].content == "current authorized policy"
+
+
 async def test_profiles_are_isolated_and_collection_dimension_is_checked(qdrant):
     first = await make_index(qdrant)
     second = QdrantIndex(qdrant, "aletora", profile(model="other-model"), embedder([1, 0, 0]))
@@ -92,7 +194,7 @@ async def test_profiles_are_isolated_and_collection_dimension_is_checked(qdrant)
 
     hits = await second.search(scope, "q", limit=10, offset=0)
     assert [hit.candidate_id for hit in hits] == ["same-id"]
-    await first.delete(scope, "same-id")
+    await first.delete(scope, "same-id", 1)
     assert await first.search(scope, "q", limit=10, offset=0) == ()
     assert [hit.candidate_id for hit in await second.search(scope, "q", limit=10, offset=0)] == [
         "same-id"
@@ -197,3 +299,10 @@ async def test_upsert_rejects_invalid_revision(qdrant, revision):
     index = await make_index(qdrant)
     with pytest.raises(ValueError, match="revision"):
         await index.upsert(Scope("tenant", "main"), "candidate", revision, [1, 0, 0])
+
+
+@pytest.mark.parametrize("revision", [0, -1, True, 1.5])
+async def test_delete_rejects_invalid_revision(qdrant, revision):
+    index = await make_index(qdrant)
+    with pytest.raises(ValueError, match="revision"):
+        await index.delete(Scope("tenant", "main"), "candidate", revision)

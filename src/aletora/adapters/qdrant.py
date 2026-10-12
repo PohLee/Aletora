@@ -170,7 +170,7 @@ class QdrantIndex:
             collection_name=self.collection,
             points=[
                 models.PointStruct(
-                    id=self._point_id(scope, candidate_id),
+                    id=self._point_id(scope, candidate_id, revision),
                     vector=checked,
                     payload=payload,
                 )
@@ -178,12 +178,25 @@ class QdrantIndex:
             wait=True,
         )
 
-    async def delete(self, scope: Scope, candidate_id: str) -> None:
+    async def delete(self, scope: Scope, candidate_id: str, revision: int) -> None:
         _scope(scope)
         _nonempty("candidate_id", candidate_id)
+        _revision(revision)
         await self.client.delete(
             collection_name=self.collection,
-            points_selector=[self._point_id(scope, candidate_id)],
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        *self._scope_conditions(scope),
+                        self._match("profile_id", self.profile.profile_id),
+                        self._match("candidate_id", candidate_id),
+                        models.FieldCondition(
+                            key="revision",
+                            range=models.Range(lte=revision),
+                        ),
+                    ]
+                )
+            ),
             wait=True,
         )
 
@@ -231,9 +244,9 @@ class QdrantIndex:
             and payload.get("profile_id") == self.profile.profile_id
         )
 
-    def _point_id(self, scope: Scope, candidate_id: str) -> str:
+    def _point_id(self, scope: Scope, candidate_id: str, revision: int) -> str:
         identity = json.dumps(
-            [scope.tenant_id, scope.namespace, candidate_id, self.profile.profile_id],
+            [scope.tenant_id, scope.namespace, candidate_id, self.profile.profile_id, revision],
             ensure_ascii=False,
             separators=(",", ":"),
         )

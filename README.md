@@ -124,6 +124,9 @@ exercise the same interface. See [the specification](docs/V1-SPEC.md) and
 - Supply a request-scoped resolver bound to the authenticated caller that reads **current,
   authorized** content for an exact formal object version. Tenant/namespace alone is not role
   authorization; do not reuse a privileged resolver for ordinary users.
+- If independent products/databases share a Qdrant server, use separate collections or globally
+  qualified Scope identities. Reusing local tenant/namespace names in the same collection does
+  not provide cross-product isolation.
 - Re-read current records in workers before updating/deleting projections; deduplicate event IDs.
 - Treat external content as untrusted evidence, not instructions or executable actions.
 

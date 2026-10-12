@@ -47,6 +47,7 @@ def _asyncpg_dsn(dsn: str) -> str:
 
 
 def _sqlalchemy_dsn(dsn: str) -> str:
+    dsn = re.sub(r"^postgres://", "postgresql://", dsn)
     if dsn.startswith("postgresql://"):
         return dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
     return dsn

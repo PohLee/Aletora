@@ -22,7 +22,9 @@ changing one of those versioned fields. Collection provisioning remains the host
 startup/deployment responsibility.
 
 Workers project candidates with `await index.upsert(scope, candidate_id, revision, vector,
-evidence_id=...)`; deletion is `await index.delete(scope, candidate_id)`. Evidence withdrawal
+evidence_id=...)`; deletion is `await index.delete(scope, candidate_id, revision)`. The delete
+revision is the highest candidate revision known to be terminal and deletes only matching
+candidate points whose projected revision is less than or equal to it. Evidence withdrawal
 events can call `await index.delete_evidence(scope, evidence_id)`, which filters on tenant,
 namespace, profile, and evidence ID. Supply evidence IDs on upsert if evidence invalidation
 must remove all affected points. The projected payload contains only scope, candidate/evidence
@@ -33,16 +35,25 @@ resolver must authorize and return the exact current formal object version.
 
 Hosts should append projection events to their transactionally durable outbox and let a worker
 re-read the authoritative record before computing/projecting it. The point ID is UUID5 over a
-JSON array of tenant, namespace, candidate ID, and profile ID, so retrying the same current
-projection (including a rebuild) replaces the same point without colliding across scopes or
-profiles. Qdrant does not compare candidate revisions atomically. Concurrent workers or
-out-of-order retries can therefore overwrite a newer vector with an older revision. Serialize
-projection per scoped candidate, or otherwise ensure stale jobs re-read and project the current
-record; revision equality is checked again by retrieval against the authoritative store. Do not
-assume that a revision in Qdrant is authoritative or that an acknowledged write is transactionally
-coupled to the host database. A failed index operation propagates and must be retried by the
-host worker. A full rebuild should follow the same re-read/ordering rules; deletes should be
-ordered with refreshes so an old refresh cannot resurrect a withdrawn point.
+JSON array of tenant, namespace, candidate ID, profile ID, and revision. Thus retries/rebuilds
+of the same revision are idempotent while different revisions cannot overwrite one another.
+Upsert does not prune older revisions: search may return stale hits, and `Memory` checks each
+hit's revision against the authoritative candidate so stale duplicates do not hide a current hit.
+Delete uses exact tenant, namespace, profile, and candidate filters plus `revision <= delete
+revision`, so a delayed lower-revision delete cannot remove a newer point. No Qdrant write
+provides an atomic compare-and-set against the host record. Serialize projection per candidate
+where possible and always reread the current record in the worker before projection; revision
+checks during retrieval remain mandatory. Do not assume Qdrant is authoritative or that an
+acknowledged write is transactionally coupled to the host database. A failed operation must be
+retried by the host worker.
+
+A delayed upsert for a terminal candidate can still recreate a point for an old revision after
+its deletion. Retrieval rejects it by rereading current state/revision, but this adapter does not
+promise physical erasure or retention. Hosts must order/reconcile terminal deletes and refreshes,
+and own retention/erasure policy. Rebuilds should read current records and follow the same worker
+ordering/re-read rules. The revision-bearing point identity changes the experimental 0.1
+projection layout; although that version is unreleased, rebuild the collection from authoritative
+records rather than expecting legacy point IDs to be migrated in place.
 
 `Scope` is expected to come from the trusted host after authorization. Search does not accept
 caller-supplied filters, and always applies exact tenant, namespace, and profile conditions;
