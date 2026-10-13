@@ -28,7 +28,6 @@ from .models import (
     Proposal,
     RetrievalHit,
     Scope,
-    SearchPage,
     SourceRef,
 )
 from .ports import EventSink, IndexAction, IndexEvent, RecordResolver, RecordStore, SearchIndex
@@ -244,13 +243,23 @@ class Memory:
         *,
         expected_revision: int,
     ) -> Candidate:
-        candidate = await self._candidate_for_mutation(scope, candidate_id, expected_revision)
+        self._require_scope(scope)
+        self._require_key(candidate_id)
+        self._require_key(replacement_id)
+        self._require_revision(expected_revision)
         self._require_actor_reason(actor, reason)
         if candidate_id == replacement_id:
             raise InvalidTransition("a candidate cannot supersede itself")
+        # Lock both rows in one stable order before validating their states.
+        # Opposing supersessions must observe the winner's committed transition.
+        locked = {}
+        for record_id in sorted((candidate_id, replacement_id)):
+            locked[record_id] = await self._load_candidate(scope, record_id, for_update=True)
+        candidate = locked[candidate_id]
+        replacement = locked[replacement_id]
+        self._check_revision(candidate.revision, expected_revision, _CANDIDATE, candidate_id)
         if candidate.state is not GovernanceState.ACCEPTED:
             raise InvalidTransition("only accepted candidates may be superseded")
-        replacement = await self._load_candidate(scope, replacement_id)
         if replacement.state is not GovernanceState.ACCEPTED:
             raise InvalidTransition("replacement candidate must be accepted")
         replacement_evidence = await self._load_evidence(scope, replacement.evidence_id)
@@ -317,22 +326,11 @@ class Memory:
 
         hits: list[RetrievalHit] = []
         returned_ids: set[str] = set()
-        offset = 0
-        scanned = 0
         now = self._now()
-        while scanned < self._scan_budget and len(hits) < limit:
-            page_size = min(max(limit * 2, 1), self._scan_budget - scanned)
-            page = await self._index.search(scope, query, limit=page_size, offset=offset)
-            if not isinstance(page, SearchPage):
-                raise TypeError("SearchIndex.search must return a SearchPage")
-            if page.scanned == 0:
-                # Nothing examined: stop rather than spin on a non-advancing page.
-                break
-            scanned += page.scanned
-            offset += page.scanned
-            for hit in page.hits[:page_size]:
+        async with self._index.scan(scope, query, budget=self._scan_budget) as discovery:
+            async for hit in discovery:
                 if not isinstance(hit, IndexHit):
-                    raise TypeError("SearchPage.hits must contain IndexHit values")
+                    raise TypeError("SearchIndex.scan must yield IndexHit values")
                 if hit.candidate_id in returned_ids or hit.profile_id != self._profile.profile_id:
                     continue
                 try:
@@ -376,8 +374,6 @@ class Memory:
                 returned_ids.add(candidate.id)
                 if len(hits) == limit:
                     break
-            if page.exhausted:
-                break
         return tuple(hits)
 
     async def _load_evidence(self, scope: Scope, evidence_id: str) -> Evidence:
@@ -387,9 +383,11 @@ class Memory:
             raise NotFound(f"evidence {evidence_id!r} was not found")
         return self._decode_evidence(scope, stored.id, stored.revision, stored.payload)
 
-    async def _load_candidate(self, scope: Scope, candidate_id: str) -> Candidate:
+    async def _load_candidate(
+        self, scope: Scope, candidate_id: str, *, for_update: bool = False
+    ) -> Candidate:
         self._require_key(candidate_id)
-        stored = await self._store.get(scope, _CANDIDATE, candidate_id)
+        stored = await self._store.get(scope, _CANDIDATE, candidate_id, for_update=for_update)
         if stored is None:
             raise NotFound(f"candidate {candidate_id!r} was not found")
         return self._decode_candidate(scope, stored.id, stored.revision, stored.payload)

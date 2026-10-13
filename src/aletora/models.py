@@ -33,6 +33,15 @@ def _enum(name: str, value: object, expected: type[Enum]) -> None:
         raise ValueError(f"{name} must be a {expected.__name__} value")
 
 
+def _validity_window(valid_from: datetime | None, valid_until: datetime | None) -> None:
+    if valid_from is not None:
+        _utc("valid_from", valid_from)
+    if valid_until is not None:
+        _utc("valid_until", valid_until)
+    if valid_from is not None and valid_until is not None and valid_from >= valid_until:
+        raise ValueError("valid_from must precede valid_until")
+
+
 class SourceKind(str, Enum):
     EXPLICIT_USER = "explicit_user"
     DOCUMENT = "document"
@@ -147,16 +156,7 @@ class Proposal:
         for name in ("proposer_id", "extractor_id", "run_id"):
             _text(name, getattr(self, name))
         _utc("proposed_at", self.proposed_at)
-        if self.valid_from is not None:
-            _utc("valid_from", self.valid_from)
-        if self.valid_until is not None:
-            _utc("valid_until", self.valid_until)
-        if (
-            self.valid_from is not None
-            and self.valid_until is not None
-            and self.valid_from >= self.valid_until
-        ):
-            raise ValueError("valid_from must precede valid_until")
+        _validity_window(self.valid_from, self.valid_until)
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,16 +237,7 @@ class Candidate:
         _enum("epistemic_kind", self.epistemic_kind, EpistemicKind)
         _enum("state", self.state, GovernanceState)
         _utc("proposed_at", self.proposed_at)
-        if self.valid_from is not None:
-            _utc("valid_from", self.valid_from)
-        if self.valid_until is not None:
-            _utc("valid_until", self.valid_until)
-        if (
-            self.valid_from is not None
-            and self.valid_until is not None
-            and self.valid_from >= self.valid_until
-        ):
-            raise ValueError("valid_from must precede valid_until")
+        _validity_window(self.valid_from, self.valid_until)
         _revision(self.revision)
         if not isinstance(self.history, tuple) or not all(
             isinstance(item, GovernanceEntry) for item in self.history
@@ -359,31 +350,3 @@ class IndexHit:
         ):
             raise ValueError("score must be finite")
         _text("profile_id", self.profile_id)
-
-
-@dataclass(frozen=True, slots=True)
-class SearchPage:
-    """One raw index page: validated hits plus raw scan accounting.
-
-    `scanned` counts every raw point the adapter examined to build this
-    page, including points discarded as malformed. `exhausted` reports
-    whether no further raw points exist beyond this page. Callers advance
-    their raw offset by `scanned` and stop only on `exhausted`, so a page
-    shortened by discarded points never looks like the end of the index.
-    """
-
-    hits: tuple[IndexHit, ...]
-    scanned: int
-    exhausted: bool
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.hits, tuple) or not all(
-            isinstance(hit, IndexHit) for hit in self.hits
-        ):
-            raise ValueError("hits must be a tuple of IndexHit values")
-        if isinstance(self.scanned, bool) or not isinstance(self.scanned, int):
-            raise ValueError("scanned must be an integer")
-        if self.scanned < 0:
-            raise ValueError("scanned must be non-negative")
-        if not isinstance(self.exhausted, bool):
-            raise ValueError("exhausted must be a boolean")

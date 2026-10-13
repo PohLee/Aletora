@@ -28,11 +28,34 @@ candidate points whose projected revision is less than or equal to it. Evidence 
 events can call `await index.delete_evidence(scope, evidence_id)`, which filters on tenant,
 namespace, profile, and evidence ID. Supply evidence IDs on upsert if evidence invalidation
 must remove all affected points. The projected payload contains only scope, candidate/evidence
-IDs, profile ID, and revision—not candidate or evidence text. Search returns a `SearchPage`:
-validated `IndexHit` candidate IDs, revisions, profile identity, and Qdrant score, plus raw
-`scanned`/`exhausted` accounting so retrieval keeps paging past discarded points. It is a discovery mechanism, not
-an authorization decision; `Memory` must reread the current candidate/evidence and the host
-resolver must authorize and return the exact current formal object version.
+IDs, profile ID, and revision—not candidate or evidence text. `scan` yields validated `IndexHit`
+candidate IDs, revisions, profile identity and Qdrant score through one async context manager.
+It is a discovery mechanism, not an authorization decision; `Memory` must reread the current
+candidate/evidence and the host resolver must authorize and return the exact current formal
+object version.
+
+```python
+async with index.scan(scope, "approval policy", budget=200) as discoveries:
+    async for hit in discoveries:
+        # A discovery is not authorized business content.
+        # Normally Memory.retrieve performs the required governance and host resolution.
+        print(hit.candidate_id, hit.revision)
+```
+
+Each scan prepares the query embedding once. Raw pagination and exhaustion stay inside the
+adapter; points with malformed payloads still consume the positive integer budget, and an
+entirely discarded page does not hide later valid discoveries. Invalid or nonfinite scores
+continue to raise explicitly instead of entering retrieval. Backend requests never exceed the remaining budget.
+The adapter fetches lazily in bounded batches and does not request another page after the
+consumer stops. A small result limit can still fetch extra raw points in the current batch.
+On early exit, error or cancellation the context closes traversal-local iteration, not the
+host's Qdrant client. Concurrent scans have independent query vectors and continuation state;
+there is no cross-request cache. A traversal does not promise snapshot consistency while the
+projection changes. Embedder and backend failures propagate without fallback.
+
+This replaces the unreleased 0.1 `search(scope, query, limit=..., offset=...)` method and
+`SearchPage` type. Custom index adapters must implement `SearchIndex.scan`; callers already
+using `Memory.retrieve` need no change.
 
 Hosts should append projection events to their transactionally durable outbox and let a worker
 re-read the authoritative record before computing/projecting it. The point ID is UUID5 over a

@@ -46,6 +46,13 @@ uv run --frozen pytest
 uv run --frozen python -m build --no-isolation
 ```
 
+Shared host-transaction scenarios use the `postgres_host` fixture from `tests/conftest.py`.
+It runs each scenario against SQLAlchemy and Tortoise on real PostgreSQL. The test-host module
+in `tests/postgres_host.py` owns isolated schema setup, host transactions, durable outbox/formal
+writes, failure injection and independent committed-state observation. Governance and atomicity
+assertions belong in the scenarios; adapter-specific transaction-mode and RLS checks keep their
+own direct setup. Add a common guarantee once, then verify it against both adapters.
+
 The pytest `postgres` marker denotes cases that need the isolated test database. Without
 `ALETORA_TEST_POSTGRES_DSN`, those cases are skipped; the rest of the suite remains runnable.
 PostgreSQL adapter tests use a restricted role provisioned by the test setup and must not use a

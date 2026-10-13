@@ -95,9 +95,16 @@ class PostgresRecordContract:
         return params
 
     async def get(
-        self, execute: Executor, scope: Scope, kind: str, record_id: str
+        self,
+        execute: Executor,
+        scope: Scope,
+        kind: str,
+        record_id: str,
+        *,
+        for_update: bool = False,
     ) -> StoredRecord | None:
-        row = await execute(self.get_sql, _scope_params(scope, kind, record_id))
+        statement = self.get_sql + (" FOR UPDATE" if for_update else "")
+        row = await execute(statement, _scope_params(scope, kind, record_id))
         return decode_record(row) if row is not None else None
 
     async def insert(

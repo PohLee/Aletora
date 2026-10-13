@@ -75,8 +75,8 @@ class CorruptingReadStore:
         self.mode = mode
         self.version = version
 
-    async def get(self, scope: Scope, kind: str, record_id: str):
-        record = await self.store.get(scope, kind, record_id)
+    async def get(self, scope: Scope, kind: str, record_id: str, *, for_update: bool = False):
+        record = await self.store.get(scope, kind, record_id, for_update=for_update)
         if record is None or kind != self.kind:
             return record
         payload = dict(record.payload)
@@ -93,10 +93,10 @@ class StaleCandidateReadStore:
         self.store = store
         self.stale = stale
 
-    async def get(self, scope: Scope, kind: str, record_id: str):
+    async def get(self, scope: Scope, kind: str, record_id: str, *, for_update: bool = False):
         if kind == "candidate" and record_id == self.stale.id:
             return self.stale
-        return await self.store.get(scope, kind, record_id)
+        return await self.store.get(scope, kind, record_id, for_update=for_update)
 
     async def insert(self, *args, **kwargs):
         return await self.store.insert(*args, **kwargs)

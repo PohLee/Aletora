@@ -16,6 +16,8 @@ SQLAlchemy session has no active transaction and rejects a bare Tortoise
 client. `schema=` accepts only a simple PostgreSQL identifier. Omit it to use
 the caller's unchanged `search_path`.
 
+SQLAlchemy's `session.in_transaction()` describes an ORM logical transaction, which can exist even when the database is in AUTOCOMMIT. Before executing Aletora SQL, the adapter resolves the session's actual connection and checks its DBAPI transaction mode. AUTOCOMMIT is rejected rather than changed; an uninspectable mode also fails closed. Configure a transactional isolation level before beginning the host transaction. This applies to engine defaults, inherited execution options and explicitly bound connections; a connection override back to a transactional mode is allowed.
+
 Tortoise currently exposes no public check for whether its transaction wrapper
 is still active. To fail closed before every statement, the adapter checks the
 wrapper's PostgreSQL dialect and its `_finalized`, `transaction`, and
@@ -80,6 +82,12 @@ returns an existing record only when its fingerprint matches; otherwise it
 raises `IdempotencyConflict`. `update` increments the revision only when the
 expected revision matches and distinguishes a missing/invisible scoped row
 (`NotFound`) from a lost compare-and-swap (`RevisionConflict`).
+
+## Concurrent supersession
+
+`Memory.supersede` reads both candidates with `RecordStore.get(..., for_update=True)` in sorted record-ID order, then validates the locked states and the original candidate's expected revision. Both row locks remain owned by the host transaction until commit or rollback. A competing reciprocal supersession waits and then checks current state, so both requests cannot commit a replacement cycle. Read-only lookups do not acquire these locks.
+
+The ordering avoids opposite lock order within one supersession call. Hosts performing several operations or taking their own locks in a transaction must still handle PostgreSQL deadlock/serialization errors by rolling back and retrying the entire unit of work when appropriate; the library does not retry or commit part of it. Custom `RecordStore` implementations must honor `for_update` for concurrent storage. The supplied in-memory store already permits only one active owner.
 
 ## Migration rollback
 

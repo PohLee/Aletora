@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
-from .models import FormalRef, ResolvedRecord, Scope, SearchPage
+from .models import FormalRef, IndexHit, ResolvedRecord, Scope
 
 
 class IndexAction(str, Enum):
@@ -63,7 +65,11 @@ class IndexEvent:
 
 
 class RecordStore(Protocol):
-    async def get(self, scope: Scope, kind: str, record_id: str) -> StoredRecord | None: ...
+    async def get(
+        self, scope: Scope, kind: str, record_id: str, *, for_update: bool = False
+    ) -> StoredRecord | None:
+        """Read a scoped snapshot, optionally locking it until the host transaction ends."""
+        ...
 
     async def insert(
         self,
@@ -90,7 +96,18 @@ class EventSink(Protocol):
 
 
 class SearchIndex(Protocol):
-    async def search(self, scope: Scope, query: str, *, limit: int, offset: int) -> SearchPage: ...
+    def scan(
+        self, scope: Scope, query: str, *, budget: int
+    ) -> AbstractAsyncContextManager[AsyncIterator[IndexHit]]:
+        """Open one bounded, single-use traversal of untrusted discovery hits.
+
+        Prepare the query once and examine at most ``budget`` raw points, including
+        malformed points discarded before yielding. Fetch lazily without prefetch;
+        exhaustion or budget ends iteration. Each call has independent state.
+        Context exit closes traversal-local resources on early stop or failure,
+        without closing host-owned dependencies. Errors and cancellation propagate.
+        """
+        ...
 
 
 class RecordResolver(Protocol):

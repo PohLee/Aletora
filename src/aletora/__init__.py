@@ -26,7 +26,6 @@ from .models import (
     ResolvedRecord,
     RetrievalHit,
     Scope,
-    SearchPage,
     SourceKind,
     SourceRef,
 )
@@ -55,7 +54,6 @@ __all__ = [
     "RetrievalHit",
     "RevisionConflict",
     "Scope",
-    "SearchPage",
     "SourceKind",
     "SourceRef",
 ]

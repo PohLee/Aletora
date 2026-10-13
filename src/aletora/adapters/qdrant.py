@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import aclosing, asynccontextmanager
 from typing import Any
 from uuid import UUID, uuid5
 
@@ -18,9 +19,10 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised without the o
         ) from exc
     raise
 
-from ..models import EmbeddingProfile, IndexHit, Scope, SearchPage
+from ..models import EmbeddingProfile, IndexHit, Scope
 
 Embed = Callable[[str], Awaitable[Sequence[float]]]
+_SCAN_BATCH_SIZE = 32
 _POINT_NAMESPACE = UUID("d731c2e8-cc62-5e5c-8a26-6d722d6144b8")
 
 
@@ -104,52 +106,60 @@ class QdrantIndex:
         if vectors.distance != models.Distance.COSINE:
             raise ValueError("collection distance must be cosine")
 
-    async def search(
-        self,
-        scope: Scope,
-        query: str,
-        *,
-        limit: int,
-        offset: int,
-    ) -> SearchPage:
-        """Return validated hits with raw scan accounting.
+    @asynccontextmanager
+    async def scan(
+        self, scope: Scope, query: str, *, budget: int
+    ) -> AsyncIterator[AsyncIterator[IndexHit]]:
+        """Prepare once and lazily traverse at most ``budget`` raw filtered points.
 
-        `offset` counts raw filtered points already scanned, not validated
-        hits. `scanned` reports every raw point examined (including points
-        discarded as malformed) and `exhausted` reports whether the
-        collection holds no further raw points, so callers keep paging past
-        discarded points instead of mistaking a shortened page for the end.
+        Discarded payloads consume budget and do not imply exhaustion. Context exit
+        closes only this traversal; the caller retains ownership of the client.
+        The query is fixed for this traversal, but the index is not a snapshot.
         """
         _scope(scope)
         _nonempty("query", query)
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
-            raise ValueError("limit must be a positive integer")
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-            raise ValueError("offset must be a non-negative integer")
-        vector = _checked_vector(await self._embed(query), self.profile.dimension)
-        result = await self.client.query_points(
-            collection_name=self.collection,
-            query=vector,
-            query_filter=self._filter(scope),
-            limit=limit,
-            offset=offset,
-            with_payload=True,
-            with_vectors=False,
-        )
-        raw = list(result.points)
-        hits: list[IndexHit] = []
-        for point in raw:
-            payload = point.payload
-            if not isinstance(payload, dict) or not self._payload_matches(payload, scope):
-                continue
-            candidate_id = payload.get("candidate_id")
-            revision = payload.get("revision")
-            if not isinstance(candidate_id, str) or not candidate_id.strip():
-                continue
-            if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
-                continue
-            hits.append(IndexHit(candidate_id, revision, point.score, self.profile.profile_id))
-        return SearchPage(tuple(hits), len(raw), len(raw) < limit)
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise ValueError("budget must be a positive integer")
+        client, collection, profile = self.client, self.collection, self.profile
+        query_filter = self._filter(scope)
+        profile_id = profile.profile_id
+        vector = _checked_vector(await self._embed(query), profile.dimension)
+
+        async def discover() -> AsyncGenerator[IndexHit, None]:
+            offset = 0
+            while offset < budget:
+                page_size = min(_SCAN_BATCH_SIZE, budget - offset)
+                result = await client.query_points(
+                    collection_name=collection,
+                    query=vector,
+                    query_filter=query_filter,
+                    limit=page_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                raw = list(result.points)
+                if len(raw) > page_size:
+                    raise ValueError("Qdrant returned more raw points than requested")
+                offset += len(raw)
+                for point in raw:
+                    payload = point.payload
+                    if not isinstance(payload, dict) or not self._payload_matches(
+                        payload, scope, profile_id
+                    ):
+                        continue
+                    candidate_id = payload.get("candidate_id")
+                    revision = payload.get("revision")
+                    if not isinstance(candidate_id, str) or not candidate_id.strip():
+                        continue
+                    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+                        continue
+                    yield IndexHit(candidate_id, revision, point.score, profile_id)
+                if len(raw) < page_size:
+                    break
+
+        async with aclosing(discover()) as discovery:
+            yield discovery
 
     async def upsert(
         self,
@@ -246,11 +256,12 @@ class QdrantIndex:
     def _match(key: str, value: str) -> models.FieldCondition:
         return models.FieldCondition(key=key, match=models.MatchValue(value=value))
 
-    def _payload_matches(self, payload: dict[str, Any], scope: Scope) -> bool:
+    @staticmethod
+    def _payload_matches(payload: dict[str, Any], scope: Scope, profile_id: str) -> bool:
         return (
             payload.get("tenant_id") == scope.tenant_id
             and payload.get("namespace") == scope.namespace
-            and payload.get("profile_id") == self.profile.profile_id
+            and payload.get("profile_id") == profile_id
         )
 
     def _point_id(self, scope: Scope, candidate_id: str, revision: int) -> str:

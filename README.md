@@ -90,8 +90,10 @@ an embedding profile and a request-scoped host resolver; a missing capability ra
 `retrieve(..., limit=10)` returns authorized formal content and citations, never index text.
 The result preserves epistemic kind, governance state, profile identity and a separate retrieval
 score. Limits are 1–100; the default scan budget is 200 raw scanned index points. Denied or stale hits are skipped,
-but exhausting that finite budget may return fewer results. Reads are checked during the caller's
-transaction; results are not a durable authorization grant or a guarantee against later revocation.
+but exhausting that finite budget may return fewer results. A single context-managed index scan
+prepares the query once and owns raw pagination; Memory stops consuming when enough authorized
+results exist. Reads are checked during the caller's transaction; results are not a durable
+authorization grant or a guarantee against later revocation.
 
 ## Ownership and architecture
 
@@ -116,7 +118,7 @@ exercise the same interface. See [the specification](docs/V1-SPEC.md) and
 ## Integration responsibilities
 
 - Construct `Scope` only after authentication and object authorization; it is not a security token.
-- Supply an already-open transaction and an outbox sink using that same transaction. Roll back
+- Supply an already-open transaction and an outbox sink using that same transaction. SQLAlchemy AUTOCOMMIT connections are rejected before Aletora SQL. Roll back
   on any failed write, including an outbox failure; adapters do not commit, roll back or close it.
 - Apply package SQL templates using your migration tooling. Validate shared RLS and dedicated
   schema provisioning for your deployment; do not assume an ORM adapter alone provides RLS.

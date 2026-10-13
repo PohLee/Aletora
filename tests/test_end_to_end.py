@@ -325,7 +325,8 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
 
         assert await retrieve(scope, "policy-reader") == ()
         await index.delete_evidence(scope, evidence.id)
-        assert (await index.search(scope, "approval policy", limit=5, offset=0)).hits == ()
+        async with index.scan(scope, "approval policy", budget=5) as discovery:
+            assert [hit async for hit in discovery] == []
         assert await retrieve(scope, "policy-reader") == ()
     finally:
         await qdrant.close()

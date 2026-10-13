@@ -1,6 +1,7 @@
 """Acceptance cases for the public V1 Memory contract."""
 
 import asyncio
+from contextlib import aclosing, asynccontextmanager
 from datetime import datetime, timezone
 
 import pytest
@@ -15,7 +16,6 @@ from aletora import (
     Proposal,
     ResolvedRecord,
     Scope,
-    SearchPage,
     SourceKind,
     SourceRef,
 )
@@ -90,12 +90,20 @@ async def _accepted_applied(memory: Memory, scope: Scope, key: str = "candidate"
 class _SearchIndex:
     def __init__(self, hits: list[IndexHit]):
         self.hits = hits
-        self.calls: list[tuple[Scope, str, int, int]] = []
+        self.calls: list[tuple[Scope, str, int]] = []
+        self.consumed = []
 
-    async def search(self, scope: Scope, query: str, *, limit: int, offset: int):
-        self.calls.append((scope, query, limit, offset))
-        page = self.hits[offset : offset + limit]
-        return SearchPage(tuple(page), len(page), offset + limit >= len(self.hits))
+    @asynccontextmanager
+    async def scan(self, scope: Scope, query: str, *, budget: int):
+        self.calls.append((scope, query, budget))
+
+        async def discover():
+            for hit in self.hits[:budget]:
+                self.consumed.append(hit)
+                yield hit
+
+        async with aclosing(discover()) as discovery:
+            yield discovery
 
 
 class _Resolver:
@@ -450,8 +458,8 @@ async def test_retrieval_caps_scans_and_never_returns_more_than_limit():
     async with database.transaction():
         results = await retrieval.retrieve(scope, "query", limit=1)
 
-    assert sum(call[2] for call in index.calls) <= 3
-    assert sum(len(index.hits[call[3] : call[3] + call[2]]) for call in index.calls) <= 3
+    assert index.calls == [(scope, "query", 3)]
+    assert len(index.consumed) == 3
     assert len(results) <= 1
     assert results == ()
     assert resolver.calls == []
@@ -480,7 +488,7 @@ async def test_foreign_namespace_index_id_is_not_resolved():
         results = await retrieval.retrieve(queried_scope, "query", limit=1)
 
     assert results == ()
-    assert index.calls == [(queried_scope, "query", 2, 0)]
+    assert index.calls == [(queried_scope, "query", 200)]
     assert resolver.calls == []
 
 
@@ -527,7 +535,8 @@ async def test_retrieval_revalidates_stale_profile_and_role_denial_across_pages(
     assert {result.candidate_id for result in results} == {allowed_one.id, allowed_two.id}
     assert len(results) == 2
     assert all(result.content != "denied content" for result in results)
-    assert index.calls == [(scope, "query", 4, 0), (scope, "query", 4, 4)]
+    assert index.calls == [(scope, "query", 8)]
+    assert len(index.consumed) == 6
     assert [ref for _, ref in resolver.calls] == [denied_ref, ref_one, ref_two]
 
 

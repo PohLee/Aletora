@@ -17,7 +17,6 @@ from aletora.models import (
     Proposal,
     RetrievalHit,
     Scope,
-    SearchPage,
     SourceKind,
     SourceRef,
 )
@@ -116,20 +115,3 @@ def test_retrieval_hit_exposes_typed_explanation_metadata_separately_from_score(
             hit.governance_state,
             hit.profile_id,
         )
-
-
-def test_search_page_reports_raw_scan_accounting_separately_from_hits():
-    hit = IndexHit("candidate-1", 1, 0.5, "profile-v1")
-    page = SearchPage((hit,), 4, False)
-
-    assert page.hits == (hit,)
-    assert page.scanned == 4
-    assert page.exhausted is False
-    with pytest.raises(ValueError):
-        SearchPage((hit,), -1, False)
-    with pytest.raises(ValueError):
-        SearchPage((hit,), True, False)
-    with pytest.raises(ValueError):
-        SearchPage((hit,), 1, "yes")
-    with pytest.raises(ValueError):
-        SearchPage([hit], 1, True)

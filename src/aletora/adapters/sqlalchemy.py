@@ -53,7 +53,16 @@ class SQLAlchemyRecordStore:
     async def _execute(
         self, session: AsyncSession, statement: str, params: dict[str, Any]
     ) -> Mapping[str, Any] | None:
-        result = await session.execute(self._text(statement), params)
+        clause = self._text(statement)
+        connection = await session.connection(bind_arguments={"clause": clause})
+        dbapi_connection = (await connection.get_raw_connection()).dbapi_connection
+        # SQLAlchemy's logical transaction and get_isolation_level() do not reveal
+        # DBAPI AUTOCOMMIT. Read the actual connection, including caller overrides.
+        if getattr(dbapi_connection, "autocommit", None) is not False:
+            raise RuntimeError(
+                "SQLAlchemy AsyncSession requires a non-AUTOCOMMIT database transaction"
+            )
+        result = await connection.execute(clause, params)
         row = result.mappings().first()
         return dict(row) if row is not None else None
 
@@ -63,10 +72,13 @@ class SQLAlchemyRecordStore:
         kind: str,
         record_id: str,
         *,
+        for_update: bool = False,
         session: AsyncSession | None = None,
     ) -> StoredRecord | None:
         active = self._active(session)
-        return await self._contract.get(self._execute_for(active), scope, kind, record_id)
+        return await self._contract.get(
+            self._execute_for(active), scope, kind, record_id, for_update=for_update
+        )
 
     def _execute_for(self, session: AsyncSession) -> Executor:
         async def execute(statement: str, params: dict[str, Any]) -> Mapping[str, Any] | None:

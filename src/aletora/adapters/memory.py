@@ -89,7 +89,10 @@ class InMemoryRecordStore(RecordStore):
     def __init__(self, database: InMemoryDatabase) -> None:
         self._database = database
 
-    async def get(self, scope: Scope, kind: str, record_id: str) -> StoredRecord | None:
+    async def get(
+        self, scope: Scope, kind: str, record_id: str, *, for_update: bool = False
+    ) -> StoredRecord | None:
+        # The transaction already excludes every other task from the database.
         transaction = self._database._require_transaction()
         stored = transaction.records.get((scope.tenant_id, scope.namespace, kind, record_id))
         return deepcopy(stored) if stored is not None else None

@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import aclosing, asynccontextmanager
 from datetime import datetime, timezone
 
 import pytest
@@ -12,7 +14,6 @@ from aletora import (
     Proposal,
     ResolvedRecord,
     Scope,
-    SearchPage,
     SourceKind,
     SourceRef,
 )
@@ -27,14 +28,26 @@ PROFILE = EmbeddingProfile("embed-v2", 4, "prep-v1", "chunk-v3")
 class FakeIndex:
     def __init__(self, hits: list[IndexHit] | Exception) -> None:
         self.hits = hits
-        self.calls: list[tuple[Scope, str, int, int]] = []
+        self.calls: list[tuple[Scope, str, int]] = []
+        self.consumed = []
+        self.closed = 0
 
-    async def search(self, scope: Scope, query: str, *, limit: int, offset: int):
-        self.calls.append((scope, query, limit, offset))
+    @asynccontextmanager
+    async def scan(self, scope: Scope, query: str, *, budget: int):
+        self.calls.append((scope, query, budget))
         if isinstance(self.hits, Exception):
             raise self.hits
-        page = self.hits[offset : offset + limit]
-        return SearchPage(tuple(page), len(page), offset + limit >= len(self.hits))
+
+        async def discover():
+            for hit in self.hits[:budget]:
+                self.consumed.append(hit)
+                yield hit
+
+        async with aclosing(discover()) as discovery:
+            try:
+                yield discovery
+            finally:
+                self.closed += 1
 
 
 class FakeResolver:
@@ -295,8 +308,9 @@ async def test_stale_and_unauthorized_first_page_hits_do_not_block_fresh_duplica
         results = await memory.retrieve(scope, "query", limit=1)
 
     assert [result.candidate_id for result in results] == [safe.id]
-    assert len(index.calls) == 2
-    assert [call[3] for call in index.calls] == [0, 2]
+    assert index.calls == [(scope, "query", 8)]
+    assert len(index.consumed) == 4
+    assert index.closed == 1
 
 
 @pytest.mark.asyncio
@@ -407,48 +421,94 @@ async def test_resolver_version_mismatch_is_denied_and_resolver_errors_propagate
     with pytest.raises(RuntimeError, match="resolver unavailable"):
         async with database.transaction():
             await failing_resolver.retrieve(scope, "query", limit=1)
+    assert index.closed == 2
 
 
 @pytest.mark.asyncio
-async def test_discarded_raw_points_do_not_end_pagination_early():
-    """A page shortened by discarded raw points must not look like the index end."""
-
-    class RawAccountingIndex:
-        """Replays canned raw pages: discarded points still consume the scan budget."""
-
-        def __init__(self, pages: list[SearchPage]) -> None:
-            self._pages = list(pages)
-            self.calls: list[tuple[Scope, str, int, int]] = []
-
-        async def search(self, scope: Scope, query: str, *, limit: int, offset: int):
-            self.calls.append((scope, query, limit, offset))
-            return self._pages[len(self.calls) - 1]
-
+async def test_retrieval_stops_consuming_and_closes_discovery_after_success():
     database = InMemoryDatabase()
     scope = Scope("tenant-a", "policies")
-    store = InMemoryRecordStore(database)
-    sink = InMemoryEventSink(database)
+    store, sink = InMemoryRecordStore(database), InMemoryEventSink(database)
     lifecycle = Memory(store, sink, clock=lambda: NOW)
     async with database.transaction():
         safe, _ = await _accepted_applied(lifecycle, scope, "safe")
-
-    safe_ref = safe.application.ref
-    index = RawAccountingIndex(
+    ref = safe.application.ref
+    index = FakeIndex(
         [
-            SearchPage((), 4, False),
-            SearchPage((IndexHit(safe.id, safe.revision, 0.9, PROFILE.profile_id),), 1, True),
+            IndexHit(safe.id, safe.revision, 0.9, PROFILE.profile_id),
+            IndexHit("never-consumed", 1, 0.8, PROFILE.profile_id),
         ]
     )
     memory = Memory(
         store,
         sink,
         index=index,
-        resolver=FakeResolver({safe_ref: ResolvedRecord(safe_ref, "authorized content")}),
+        resolver=FakeResolver({ref: ResolvedRecord(ref, "authorized content")}),
         profile=PROFILE,
         clock=lambda: NOW,
     )
     async with database.transaction():
         results = await memory.retrieve(scope, "query", limit=1)
-
     assert [result.candidate_id for result in results] == [safe.id]
-    assert [call[3] for call in index.calls] == [0, 4]
+    assert len(index.consumed) == 1
+    assert index.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_retrieval_rejects_invalid_discovery_hits_and_closes_context():
+    database = InMemoryDatabase()
+    index = FakeIndex([object()])
+    memory = Memory(
+        InMemoryRecordStore(database),
+        InMemoryEventSink(database),
+        index=index,
+        resolver=FakeResolver({}),
+        profile=PROFILE,
+        clock=lambda: NOW,
+    )
+    with pytest.raises(TypeError, match="IndexHit"):
+        async with database.transaction():
+            await memory.retrieve(Scope("tenant-a", "main"), "query", limit=1)
+    assert index.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_resolution_closes_discovery():
+    database = InMemoryDatabase()
+    scope = Scope("tenant-a", "policies")
+    store, sink = InMemoryRecordStore(database), InMemoryEventSink(database)
+    lifecycle = Memory(store, sink, clock=lambda: NOW)
+    async with database.transaction():
+        safe, _ = await _accepted_applied(lifecycle, scope, "safe")
+    index = FakeIndex([IndexHit(safe.id, safe.revision, 0.9, PROFILE.profile_id)])
+    resolving = asyncio.Event()
+
+    class WaitingResolver:
+        async def resolve(self, request_scope, ref):
+            resolving.set()
+            await asyncio.Event().wait()
+
+    memory = Memory(
+        store,
+        sink,
+        index=index,
+        resolver=WaitingResolver(),
+        profile=PROFILE,
+        clock=lambda: NOW,
+    )
+
+    async def retrieve():
+        async with database.transaction():
+            await memory.retrieve(scope, "query", limit=1)
+
+    task = asyncio.create_task(retrieve())
+    try:
+        async with asyncio.timeout(10):
+            await resolving.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert index.closed == 1

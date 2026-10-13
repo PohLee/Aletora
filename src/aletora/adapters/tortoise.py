@@ -86,10 +86,18 @@ class TortoiseRecordStore:
         return execute
 
     async def get(
-        self, scope: Scope, kind: str, record_id: str, *, transaction: Any | None = None
+        self,
+        scope: Scope,
+        kind: str,
+        record_id: str,
+        *,
+        for_update: bool = False,
+        transaction: Any | None = None,
     ) -> StoredRecord | None:
         active = self._active(transaction)
-        return await self._contract.get(self._execute_for(active), scope, kind, record_id)
+        return await self._contract.get(
+            self._execute_for(active), scope, kind, record_id, for_update=for_update
+        )
 
     async def insert(
         self,
