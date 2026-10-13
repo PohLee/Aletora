@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: aletora_test
+          POSTGRES_USER: aletora_test_admin
+          POSTGRES_PASSWORD: aletora_test_admin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aletora_test_admin -d aletora_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ALETORA_TEST_POSTGRES_DSN: postgresql://aletora_test_admin:aletora_test_admin@localhost:5432/aletora_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen --group dev --all-extras
+      - name: Ruff lint
+        run: uv run --frozen ruff check .
+      - name: Ruff format check
+        run: uv run --frozen ruff format --check src tests
+      - name: Mypy
+        run: uv run --frozen mypy
+      - name: Tests
+        run: uv run --frozen pytest
+      - name: Build wheel and source distribution
+        run: uv run --frozen python -m build --no-isolation
+      - name: Verify core-only wheel import
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/core-smoke"
+          "$RUNNER_TEMP/core-smoke/bin/python" -m pip install dist/aletora-0.1.0-py3-none-any.whl
+          "$RUNNER_TEMP/core-smoke/bin/python" -c "import aletora, importlib.util; from aletora import Memory, Scope; assert all(importlib.util.find_spec(name) is None for name in ('sqlalchemy', 'tortoise', 'qdrant_client'))"

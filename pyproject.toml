@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aletora"
+version = "0.1.0"
+description = "Host-owned evidence and candidate governance for knowledge systems"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+
+[project.optional-dependencies]
+sqlalchemy = [
+  "SQLAlchemy[asyncio]>=2.0.36,<3",
+  "asyncpg>=0.30,<1",
+]
+tortoise = [
+  "tortoise-orm>=0.24,<1",
+  "asyncpg>=0.30,<1",
+]
+qdrant = ["qdrant-client>=1.12,<2"]
+
+[dependency-groups]
+dev = [
+  "build>=1.2,<2",
+  "hatchling>=1.27,<2",
+  "mypy>=1.13,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<2",
+  "ruff>=0.8,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aletora"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/aletora",
+  "/LICENSE",
+  "/README.md",
+  "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "postgres: requires a PostgreSQL database configured by ALETORA_TEST_POSTGRES_DSN",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["aletora"]
+warn_unreachable = true
+show_error_codes = true
