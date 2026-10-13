@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from importlib.resources import files
 
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+from .._postgres import qualified_table
+
 _MIGRATIONS = {"dedicated.sql", "shared.sql"}
 
 
@@ -23,13 +23,7 @@ def render_migration(name: str, *, schema: str | None = None) -> str:
     ``search_path`` controls dedicated-schema placement.
     """
     template = read_migration(name)
-    if schema is None:
-        table = '"aletora_records"'
-    else:
-        if not isinstance(schema, str) or not _IDENTIFIER.fullmatch(schema):
-            raise ValueError("schema must be a simple PostgreSQL identifier")
-        table = f'"{schema}"."aletora_records"'
-    return template.replace("{{table}}", table)
+    return template.replace("{{table}}", qualified_table(schema))
 
 
 __all__ = ["read_migration", "render_migration"]

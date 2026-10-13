@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
-from .models import FormalRef, IndexHit, ResolvedRecord, Scope
+from .models import FormalRef, ResolvedRecord, Scope, SearchPage
 
 
 class IndexAction(str, Enum):
@@ -90,9 +90,7 @@ class EventSink(Protocol):
 
 
 class SearchIndex(Protocol):
-    async def search(
-        self, scope: Scope, query: str, *, limit: int, offset: int
-    ) -> Sequence[IndexHit]: ...
+    async def search(self, scope: Scope, query: str, *, limit: int, offset: int) -> SearchPage: ...
 
 
 class RecordResolver(Protocol):

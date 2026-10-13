@@ -28,8 +28,9 @@ candidate points whose projected revision is less than or equal to it. Evidence 
 events can call `await index.delete_evidence(scope, evidence_id)`, which filters on tenant,
 namespace, profile, and evidence ID. Supply evidence IDs on upsert if evidence invalidation
 must remove all affected points. The projected payload contains only scope, candidate/evidence
-IDs, profile ID, and revision—not candidate or evidence text. Search returns only `IndexHit`
-candidate IDs, revisions, profile identity, and Qdrant score. It is a discovery mechanism, not
+IDs, profile ID, and revision—not candidate or evidence text. Search returns a `SearchPage`:
+validated `IndexHit` candidate IDs, revisions, profile identity, and Qdrant score, plus raw
+`scanned`/`exhausted` accounting so retrieval keeps paging past discarded points. It is a discovery mechanism, not
 an authorization decision; `Memory` must reread the current candidate/evidence and the host
 resolver must authorize and return the exact current formal object version.
 

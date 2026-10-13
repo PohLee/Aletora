@@ -359,3 +359,31 @@ class IndexHit:
         ):
             raise ValueError("score must be finite")
         _text("profile_id", self.profile_id)
+
+
+@dataclass(frozen=True, slots=True)
+class SearchPage:
+    """One raw index page: validated hits plus raw scan accounting.
+
+    `scanned` counts every raw point the adapter examined to build this
+    page, including points discarded as malformed. `exhausted` reports
+    whether no further raw points exist beyond this page. Callers advance
+    their raw offset by `scanned` and stop only on `exhausted`, so a page
+    shortened by discarded points never looks like the end of the index.
+    """
+
+    hits: tuple[IndexHit, ...]
+    scanned: int
+    exhausted: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hits, tuple) or not all(
+            isinstance(hit, IndexHit) for hit in self.hits
+        ):
+            raise ValueError("hits must be a tuple of IndexHit values")
+        if isinstance(self.scanned, bool) or not isinstance(self.scanned, int):
+            raise ValueError("scanned must be an integer")
+        if self.scanned < 0:
+            raise ValueError("scanned must be non-negative")
+        if not isinstance(self.exhausted, bool):
+            raise ValueError("exhausted must be a boolean")

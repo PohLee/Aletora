@@ -28,6 +28,7 @@ from .models import (
     Proposal,
     RetrievalHit,
     Scope,
+    SearchPage,
     SourceRef,
 )
 from .ports import EventSink, IndexAction, IndexEvent, RecordResolver, RecordStore, SearchIndex
@@ -322,14 +323,16 @@ class Memory:
         while scanned < self._scan_budget and len(hits) < limit:
             page_size = min(max(limit * 2, 1), self._scan_budget - scanned)
             page = await self._index.search(scope, query, limit=page_size, offset=offset)
-            batch = tuple(page)[:page_size]
-            if not batch:
+            if not isinstance(page, SearchPage):
+                raise TypeError("SearchIndex.search must return a SearchPage")
+            if page.scanned == 0:
+                # Nothing examined: stop rather than spin on a non-advancing page.
                 break
-            scanned += len(batch)
-            offset += page_size
-            for hit in batch:
+            scanned += page.scanned
+            offset += page.scanned
+            for hit in page.hits[:page_size]:
                 if not isinstance(hit, IndexHit):
-                    raise TypeError("SearchIndex.search must return IndexHit values")
+                    raise TypeError("SearchPage.hits must contain IndexHit values")
                 if hit.candidate_id in returned_ids or hit.profile_id != self._profile.profile_id:
                     continue
                 try:
@@ -373,7 +376,7 @@ class Memory:
                 returned_ids.add(candidate.id)
                 if len(hits) == limit:
                     break
-            if len(batch) < page_size:
+            if page.exhausted:
                 break
         return tuple(hits)
 

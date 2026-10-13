@@ -89,7 +89,7 @@ After writing a formal object in your own transaction, call `record_application`
 an embedding profile and a request-scoped host resolver; a missing capability raises an error.
 `retrieve(..., limit=10)` returns authorized formal content and citations, never index text.
 The result preserves epistemic kind, governance state, profile identity and a separate retrieval
-score. Limits are 1–100; the default scan budget is 200 index hits. Denied or stale hits are skipped,
+score. Limits are 1–100; the default scan budget is 200 raw scanned index points. Denied or stale hits are skipped,
 but exhausting that finite budget may return fewer results. Reads are checked during the caller's
 transaction; results are not a durable authorization grant or a guarantee against later revocation.
 

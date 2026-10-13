@@ -12,6 +12,7 @@ from aletora import (
     Proposal,
     ResolvedRecord,
     Scope,
+    SearchPage,
     SourceKind,
     SourceRef,
 )
@@ -32,7 +33,8 @@ class FakeIndex:
         self.calls.append((scope, query, limit, offset))
         if isinstance(self.hits, Exception):
             raise self.hits
-        return self.hits[offset : offset + limit]
+        page = self.hits[offset : offset + limit]
+        return SearchPage(tuple(page), len(page), offset + limit >= len(self.hits))
 
 
 class FakeResolver:
@@ -405,3 +407,48 @@ async def test_resolver_version_mismatch_is_denied_and_resolver_errors_propagate
     with pytest.raises(RuntimeError, match="resolver unavailable"):
         async with database.transaction():
             await failing_resolver.retrieve(scope, "query", limit=1)
+
+
+@pytest.mark.asyncio
+async def test_discarded_raw_points_do_not_end_pagination_early():
+    """A page shortened by discarded raw points must not look like the index end."""
+
+    class RawAccountingIndex:
+        """Replays canned raw pages: discarded points still consume the scan budget."""
+
+        def __init__(self, pages: list[SearchPage]) -> None:
+            self._pages = list(pages)
+            self.calls: list[tuple[Scope, str, int, int]] = []
+
+        async def search(self, scope: Scope, query: str, *, limit: int, offset: int):
+            self.calls.append((scope, query, limit, offset))
+            return self._pages[len(self.calls) - 1]
+
+    database = InMemoryDatabase()
+    scope = Scope("tenant-a", "policies")
+    store = InMemoryRecordStore(database)
+    sink = InMemoryEventSink(database)
+    lifecycle = Memory(store, sink, clock=lambda: NOW)
+    async with database.transaction():
+        safe, _ = await _accepted_applied(lifecycle, scope, "safe")
+
+    safe_ref = safe.application.ref
+    index = RawAccountingIndex(
+        [
+            SearchPage((), 4, False),
+            SearchPage((IndexHit(safe.id, safe.revision, 0.9, PROFILE.profile_id),), 1, True),
+        ]
+    )
+    memory = Memory(
+        store,
+        sink,
+        index=index,
+        resolver=FakeResolver({safe_ref: ResolvedRecord(safe_ref, "authorized content")}),
+        profile=PROFILE,
+        clock=lambda: NOW,
+    )
+    async with database.transaction():
+        results = await memory.retrieve(scope, "query", limit=1)
+
+    assert [result.candidate_id for result in results] == [safe.id]
+    assert [call[3] for call in index.calls] == [0, 4]

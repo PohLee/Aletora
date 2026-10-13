@@ -59,7 +59,8 @@ async def test_search_returns_only_scoped_profile_hits_without_projected_text(qd
     await index.upsert(Scope("tenant-2", "main"), "candidate-2", 2, [1.0, 0.0, 0.0])
     await index.upsert(Scope("tenant-1", "other"), "candidate-3", 1, [1.0, 0.0, 0.0])
 
-    hits = await index.search(scope, "query", limit=10, offset=0)
+    page = await index.search(scope, "query", limit=10, offset=0)
+    hits = page.hits
 
     assert [(hit.candidate_id, hit.revision, hit.profile_id) for hit in hits] == [
         ("candidate-1", 4, index.profile.profile_id)
@@ -78,9 +79,9 @@ async def test_upsert_is_repeatable_and_rebuild_delete_are_scope_isolated(qdrant
     await index.upsert(other_tenant, "same-id", 1, [1.0, 0.0, 0.0], evidence_id="e1")
     await index.delete(same_scope, "same-id", 2)
 
-    assert await index.search(same_scope, "query", limit=5, offset=0) == ()
-    assert len(await index.search(other_namespace, "query", limit=5, offset=0)) == 1
-    assert len(await index.search(other_tenant, "query", limit=5, offset=0)) == 1
+    assert (await index.search(same_scope, "query", limit=5, offset=0)).hits == ()
+    assert len((await index.search(other_namespace, "query", limit=5, offset=0)).hits) == 1
+    assert len((await index.search(other_tenant, "query", limit=5, offset=0)).hits) == 1
 
 
 async def test_retry_from_a_rebuilt_adapter_replaces_the_same_projection(qdrant):
@@ -91,7 +92,7 @@ async def test_retry_from_a_rebuilt_adapter_replaces_the_same_projection(qdrant)
     await rebuilt.ensure_collection()
     await rebuilt.upsert(scope, "candidate", 2, [1, 0, 0])
 
-    hits = await rebuilt.search(scope, "query", limit=10, offset=0)
+    hits = (await rebuilt.search(scope, "query", limit=10, offset=0)).hits
 
     assert [(hit.candidate_id, hit.revision) for hit in hits] == [("candidate", 2)]
 
@@ -102,17 +103,17 @@ async def test_late_old_upsert_and_delete_cannot_replace_or_remove_newer_revisio
     await index.upsert(scope, "candidate", 2, [0, 1, 0])
     await index.upsert(scope, "candidate", 1, [1, 0, 0])
 
-    hits = await index.search(scope, "query", limit=10, offset=0)
+    hits = (await index.search(scope, "query", limit=10, offset=0)).hits
     assert {(hit.candidate_id, hit.revision) for hit in hits} == {
         ("candidate", 1),
         ("candidate", 2),
     }
     await index.delete(scope, "candidate", 1)
-    hits = await index.search(scope, "query", limit=10, offset=0)
+    hits = (await index.search(scope, "query", limit=10, offset=0)).hits
     assert [(hit.candidate_id, hit.revision) for hit in hits] == [("candidate", 2)]
 
     await index.delete(scope, "candidate", 2)
-    assert await index.search(scope, "query", limit=10, offset=0) == ()
+    assert (await index.search(scope, "query", limit=10, offset=0)).hits == ()
 
 
 async def test_stale_projection_does_not_hide_current_candidate_from_memory(qdrant):
@@ -192,13 +193,13 @@ async def test_profiles_are_isolated_and_collection_dimension_is_checked(qdrant)
     await first.upsert(scope, "same-id", 1, [1, 0, 0])
     await second.upsert(scope, "same-id", 1, [1, 0, 0])
 
-    hits = await second.search(scope, "q", limit=10, offset=0)
+    hits = (await second.search(scope, "q", limit=10, offset=0)).hits
     assert [hit.candidate_id for hit in hits] == ["same-id"]
     await first.delete(scope, "same-id", 1)
-    assert await first.search(scope, "q", limit=10, offset=0) == ()
-    assert [hit.candidate_id for hit in await second.search(scope, "q", limit=10, offset=0)] == [
-        "same-id"
-    ]
+    assert (await first.search(scope, "q", limit=10, offset=0)).hits == ()
+    assert [
+        hit.candidate_id for hit in (await second.search(scope, "q", limit=10, offset=0)).hits
+    ] == ["same-id"]
     incompatible = QdrantIndex(qdrant, "aletora", profile(dimension=4), embedder([1, 0, 0, 0]))
     with pytest.raises(ValueError, match="dimension"):
         await incompatible.ensure_collection()
@@ -231,10 +232,13 @@ async def test_delete_evidence_invalidates_only_matching_scope_and_profile_point
 
     await index.delete_evidence(scope, "evidence-1")
 
-    hits = await index.search(scope, "q", limit=10, offset=0)
+    hits = (await index.search(scope, "q", limit=10, offset=0)).hits
     assert [hit.candidate_id for hit in hits] == ["two"]
-    assert len(await index.search(Scope("tenant", "other-namespace"), "q", limit=10, offset=0)) == 1
-    assert len(await index.search(Scope("other", "main"), "q", limit=10, offset=0)) == 1
+    assert (
+        len((await index.search(Scope("tenant", "other-namespace"), "q", limit=10, offset=0)).hits)
+        == 1
+    )
+    assert len((await index.search(Scope("other", "main"), "q", limit=10, offset=0)).hits) == 1
 
 
 async def test_ensure_collection_propagates_unrelated_client_error_without_creating():
@@ -272,6 +276,7 @@ async def test_search_rejects_invalid_query_vectors(qdrant):
 async def test_search_discards_malformed_candidate_payload(qdrant):
     index = await make_index(qdrant)
     scope = Scope("tenant", "main")
+    await index.upsert(scope, "good", 1, [1, 0, 0])
     await qdrant.upsert(
         collection_name="aletora",
         points=[
@@ -291,7 +296,11 @@ async def test_search_discards_malformed_candidate_payload(qdrant):
         wait=True,
     )
 
-    assert await index.search(scope, "query", limit=10, offset=0) == ()
+    page = await index.search(scope, "query", limit=10, offset=0)
+
+    assert [hit.candidate_id for hit in page.hits] == ["good"]
+    assert page.scanned == 2
+    assert page.exhausted is True
 
 
 @pytest.mark.parametrize("revision", [0, -1, True, 1.5])

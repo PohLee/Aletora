@@ -15,6 +15,7 @@ from aletora import (
     Proposal,
     ResolvedRecord,
     Scope,
+    SearchPage,
     SourceKind,
     SourceRef,
 )
@@ -93,7 +94,8 @@ class _SearchIndex:
 
     async def search(self, scope: Scope, query: str, *, limit: int, offset: int):
         self.calls.append((scope, query, limit, offset))
-        return self.hits[offset : offset + limit]
+        page = self.hits[offset : offset + limit]
+        return SearchPage(tuple(page), len(page), offset + limit >= len(self.hits))
 
 
 class _Resolver:

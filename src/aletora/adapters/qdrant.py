@@ -18,7 +18,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised without the o
         ) from exc
     raise
 
-from ..models import EmbeddingProfile, IndexHit, Scope
+from ..models import EmbeddingProfile, IndexHit, Scope, SearchPage
 
 Embed = Callable[[str], Awaitable[Sequence[float]]]
 _POINT_NAMESPACE = UUID("d731c2e8-cc62-5e5c-8a26-6d722d6144b8")
@@ -111,7 +111,15 @@ class QdrantIndex:
         *,
         limit: int,
         offset: int,
-    ) -> tuple[IndexHit, ...]:
+    ) -> SearchPage:
+        """Return validated hits with raw scan accounting.
+
+        `offset` counts raw filtered points already scanned, not validated
+        hits. `scanned` reports every raw point examined (including points
+        discarded as malformed) and `exhausted` reports whether the
+        collection holds no further raw points, so callers keep paging past
+        discarded points instead of mistaking a shortened page for the end.
+        """
         _scope(scope)
         _nonempty("query", query)
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
@@ -128,8 +136,9 @@ class QdrantIndex:
             with_payload=True,
             with_vectors=False,
         )
+        raw = list(result.points)
         hits: list[IndexHit] = []
-        for point in result.points:
+        for point in raw:
             payload = point.payload
             if not isinstance(payload, dict) or not self._payload_matches(payload, scope):
                 continue
@@ -140,7 +149,7 @@ class QdrantIndex:
             if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
                 continue
             hits.append(IndexHit(candidate_id, revision, point.score, self.profile.profile_id))
-        return tuple(hits)
+        return SearchPage(tuple(hits), len(raw), len(raw) < limit)
 
     async def upsert(
         self,

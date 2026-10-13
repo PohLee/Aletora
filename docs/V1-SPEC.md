@@ -14,9 +14,9 @@ No edits to Impulsira/ServexaOS, no public release, no LLM provider, Docling, gr
 2. Source kind (explicit user/document/tool/model), epistemic kind (asserted/inferred/question), governance state (proposed/accepted/rejected/withdrawn/superseded) are independent. Similarity and extractor confidence never authorize review or application.
 3. Evidence preserves source ID, version, locator, kind, content, SHA-256 and capture time. Content/source cannot be overwritten. Withdrawal retains the audit snapshot but prevents current retrieval; physical erasure and PII policy are host responsibilities and must be documented as unsupported in V1.
 4. Candidate includes evidence ID, text, epistemic kind, proposing actor, extractor/run identity, validity interval, revision, governance history, optional application receipt and replacement ID. No automatic acceptance. V1 prohibits self-review; hosts authenticate reviewer and application actor.
-5. `accepted` != `applied`. Only an accepted candidate can record the host's exact owner/type/ID/version receipt. This interface does not itself create a formal object or independently prove the host wrote it.
+5. `accepted` != `applied`. Only an accepted candidate whose evidence is still active can record the host's exact owner/type/ID/version receipt: revoked lineage cannot be applied, and referencing hits are blocked. This interface does not itself create a formal object or independently prove the host wrote it.
 6. All mutation writes and outbox appends participate in a caller-owned transaction. A sink failure is propagated; caller MUST rollback. Adapters do not own transactions or call network indexes during a write.
-7. Evidence/proposal imports are tenant+namespace-scoped and idempotent. Reusing a key with different semantic content raises an explicit conflict. Mutation methods require expected revision; compare-and-swap prevents lost updates. Duplicate index events use stable IDs for host deduplication.
+7. Evidence/proposal imports are tenant+namespace-scoped and idempotent. Reusing a key with different semantic content raises an explicit conflict. Evidence fingerprints cover source identity and content: a retry with a different `captured_at` returns the first snapshot rather than conflicting, since capture time is provenance metadata, not semantic content. Proposal fingerprints additionally include proposed times and validity windows. Mutation methods require expected revision; compare-and-swap prevents lost updates. Duplicate index events use stable IDs for host deduplication.
 8. Cross-Scope IDs behave as not found. All natural/unique keys and queries include tenant+namespace. PostgreSQL RLS is additional defense, not the only filtering mechanism.
 
 ## Agreed test seams
@@ -75,11 +75,18 @@ class EventSink(Protocol):
 class SearchIndex(Protocol):
     async def search(
         self, scope: Scope, query: str, *, limit: int, offset: int,
-    ) -> Sequence[IndexHit]: ...
+    ) -> SearchPage: ...
 
 class RecordResolver(Protocol):
     async def resolve(self, scope: Scope, ref: FormalRef) -> ResolvedRecord | None: ...
 ```
+
+`SearchPage(hits: tuple[IndexHit, ...], scanned: int, exhausted: bool)` carries
+raw scan accounting alongside validated hits: `scanned` counts every raw point
+the adapter examined (including points discarded as malformed) and `exhausted`
+reports whether no further raw points exist. Callers advance the raw `offset`
+by `scanned` and stop only on `exhausted`; a page shortened by discarded
+points never looks like the end of the index.
 
 `IndexHit(candidate_id: str, revision: int, score: float, profile_id: str)` is immutable; score must be finite. `FormalRef(owner, object_type, object_id, version)` identifies one exact host object version; `ResolvedRecord(ref, content)` is returned only for that authorized current version. `None` from the resolver means denied/missing/deleted; a different ref is rejected by the lifecycle module. Search results are untrusted candidates, not authorization.
 
@@ -95,7 +102,7 @@ SQLAlchemy adapter requires an active supplied AsyncSession transaction and exec
 
 Retrieval returns only accepted, applied, currently valid candidates with active evidence. IndexHit revision must equal current candidate revision; profile must match configured profile. Host resolver must return exact current FormalRef and authorized content. Results contain formal content, candidate/ref/revision, epistemic kind, governance state, profile ID, citations and separate retrieval score; no raw candidate/evidence text or unverified index text enters context. Any adapter error propagates (no insecure fallback).
 
-Page/overfetch within a documented finite scan budget to fill authorized result slots; limit is positive and bounded. Deduplicate IDs; never return more than requested. Missing index or resolver raises an explicit capability error. A configured index returning no matches returns an empty result. A scan-budget shortfall may return fewer results, never unsafe results.
+Page/overfetch within a documented finite scan budget to fill authorized result slots; limit is positive and bounded. The budget counts raw scanned points, not validated hits, and pagination advances by raw scanned counts until the adapter reports exhaustion. Deduplicate IDs; never return more than requested. Missing index or resolver raises an explicit capability error. A configured index returning no matches returns an empty result. A scan-budget shortfall may return fewer results, never unsafe results.
 
 Qdrant adapter receives caller-owned AsyncQdrantClient, explicit collection and versioned EmbeddingProfile (model, dimension, preprocessing/chunking versions). It uses an injected async embed callable for search; no supplier SDK. Worker-facing upsert/delete validate scope, dimensions, profile and candidate revision. Stable point ID includes Scope, candidate ID, profile and revision: retrying the same revision is idempotent, while a delayed older upsert cannot overwrite a newer revision. Candidate deletion requires a positive revision and removes only matching projections at or below it, never a newer revision. Exact payload tenant/namespace/profile filtering and current revision re-read during retrieval remain mandatory. Older revisions may persist and consume the finite scan budget until worker cleanup/rebuild; no strict recall-quality or physical-erasure guarantee is made. No automatic collection or network access on import. Worker retry/rebuild/delete, delayed old upsert/delete and profile mismatch tests use real local-mode Qdrant.
 
