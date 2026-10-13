@@ -9,6 +9,29 @@ Inspired by Greek aletheia (truth) and orchestration. Suggests an intelligence e
 
 > **V1 / experimental:** Aletora 0.1 has not been publicly released. Its adapter interfaces may still change.
 
+
+## Ownership and architecture
+~~~mermaid
+flowchart LR
+    H[Host application / extractor] -->|Evidence and proposal| M[Aletora Memory]
+    U[Authenticated reviewer] -->|Accept or reject| M
+    M -->|Evidence, candidate, receipt| T[Host transaction adapter]
+    T --> PG[(PostgreSQL)]
+    M -->|Index event in same transaction| O[Host outbox]
+    O --> W[Host worker]
+    W -->|Project eligible candidates| Q[(Qdrant projection)]
+    M -->|Semantic search| Q
+    Q -->|Candidate IDs and revisions| M
+    M -->|Resolve exact current FormalRef| R[Host resolver + authorization]
+    R --> F[Current formal business record]
+~~~
+A small interface concentrates lifecycle and retrieval checks in one deep module. Concrete
+in-memory, SQLAlchemy and Tortoise adapters justify the persistence seam; callers and tests
+exercise the same interface. See [the specification](docs/V1-SPEC.md) and
+[ADR-0001](docs/adr/0001-host-owned-truth-and-transactions.md).
+
+
+
 ## How it fits into your application
 
 ~~~text
