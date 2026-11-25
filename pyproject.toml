@@ -58,6 +58,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
   "postgres: requires a PostgreSQL database configured by ALETORA_TEST_POSTGRES_DSN",
+  "qdrant_server: requires a Qdrant server configured by ALETORA_TEST_QDRANT_URL",
 ]
 
 [tool.ruff]
@@ -65,13 +66,40 @@ target-version = "py312"
 line-length = 100
 src = ["src"]
 
+[tool.ruff.format]
+# Markdown code samples are hand-formatted documentation, not package code.
+exclude = ["*.md"]
+
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "SIM"]
+select = ["E", "F", "I", "B", "SIM", "UP", "RUF", "ASYNC"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-mypy_path = "src"
-packages = ["aletora"]
+mypy_path = ["src", "tests"]
+files = ["src", "tests"]
 warn_unreachable = true
 show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = ["asyncpg", "asyncpg.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+  "conftest",
+  "postgres_host",
+  "test_end_to_end",
+  "test_golden",
+  "test_host_transactions",
+  "test_lifecycle",
+  "test_models",
+  "test_postgres",
+  "test_qdrant",
+  "test_retrieval",
+  "test_sqlalchemy_transaction_mode",
+  "test_supersession_concurrency",
+]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
+disallow_incomplete_defs = false

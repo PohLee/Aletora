@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+import numbers
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sized,
+)
+from collections.abc import (
+    Set as AbstractSet,
+)
 from contextlib import aclosing, asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid5
 
 try:
@@ -19,9 +32,30 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised without the o
         ) from exc
     raise
 
-from ..models import EmbeddingProfile, IndexHit, Scope
+from ..errors import NotFound
+from ..models import (
+    Candidate,
+    EmbeddingProfile,
+    EvidenceState,
+    GovernanceState,
+    IndexHit,
+    Scope,
+)
+from ..ports import IndexAction, IndexEvent
 
-Embed = Callable[[str], Awaitable[Sequence[float]]]
+if TYPE_CHECKING:
+    from ..memory import Memory
+
+
+class VectorLike(Protocol):
+    """Sized iterable of numeric vector components (lists, tuples, 1D arrays)."""
+
+    def __len__(self) -> int: ...
+
+    def __iter__(self) -> Iterator[Any]: ...
+
+
+Embed = Callable[[str], Awaitable[VectorLike]]
 _SCAN_BATCH_SIZE = 32
 _POINT_NAMESPACE = UUID("d731c2e8-cc62-5e5c-8a26-6d722d6144b8")
 
@@ -29,23 +63,28 @@ _POINT_NAMESPACE = UUID("d731c2e8-cc62-5e5c-8a26-6d722d6144b8")
 def _nonempty(name: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+    if "\x00" in value:
+        raise ValueError(f"{name} must not contain NUL bytes")
     return value
 
 
-def _checked_vector(vector: Sequence[float], dimension: int) -> list[float]:
-    if isinstance(vector, (str, bytes)) or not isinstance(vector, Sequence):
+def _checked_vector(vector: VectorLike, dimension: int) -> list[float]:
+    if (
+        isinstance(vector, (str, bytes, bytearray, memoryview, Mapping, AbstractSet))
+        or not isinstance(vector, Sized)
+        or not isinstance(vector, Iterable)
+    ):
         raise ValueError("vector must be a finite numeric sequence of the configured dimension")
     if len(vector) != dimension:
         raise ValueError(f"vector dimension must be {dimension}")
     result: list[float] = []
     for value in vector:
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-        ):
+        if isinstance(value, bool) or not isinstance(value, numbers.Real):
             raise ValueError("vector values must be finite numbers (booleans are not numbers)")
-        result.append(float(value))
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError("vector values must be finite numbers (booleans are not numbers)")
+        result.append(converted)
     return result
 
 
@@ -79,20 +118,25 @@ class QdrantIndex:
         self._embed = embed
 
     async def ensure_collection(self) -> None:
-        """Create the collection if absent; otherwise verify its unnamed vector dimension.
+        """Create the collection if absent, verify vector config, and ensure payload indexes.
 
         A collection may hold multiple profile IDs, but every profile must have this same
         vector dimension. Searches always filter to the exact full profile identity.
         """
         if not await self.client.collection_exists(self.collection):
-            await self.client.create_collection(
-                collection_name=self.collection,
-                vectors_config=models.VectorParams(
-                    size=self.profile.dimension,
-                    distance=models.Distance.COSINE,
-                ),
-            )
-            return
+            try:
+                await self.client.create_collection(
+                    collection_name=self.collection,
+                    vectors_config=models.VectorParams(
+                        size=self.profile.dimension,
+                        distance=models.Distance.COSINE,
+                    ),
+                )
+            except Exception:
+                # Concurrent worker startup can race between collection_exists and
+                # create_collection; verify schema if another worker created it.
+                if not await self.client.collection_exists(self.collection):
+                    raise
         info = await self.client.get_collection(self.collection)
         vectors = info.config.params.vectors
         if vectors is None or isinstance(vectors, dict):
@@ -105,6 +149,27 @@ class QdrantIndex:
             )
         if vectors.distance != models.Distance.COSINE:
             raise ValueError("collection distance must be cosine")
+        await self._ensure_payload_indexes()
+
+    async def _ensure_payload_indexes(self) -> None:
+        indexes: tuple[tuple[str, Any], ...] = (
+            (
+                "tenant_id",
+                models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD, is_tenant=True),
+            ),
+            ("namespace", models.PayloadSchemaType.KEYWORD),
+            ("profile_id", models.PayloadSchemaType.KEYWORD),
+            ("candidate_id", models.PayloadSchemaType.KEYWORD),
+            ("evidence_id", models.PayloadSchemaType.KEYWORD),
+            ("revision", models.PayloadSchemaType.INTEGER),
+        )
+        for field_name, field_schema in indexes:
+            await self.client.create_payload_index(
+                collection_name=self.collection,
+                field_name=field_name,
+                field_schema=field_schema,
+                wait=True,
+            )
 
     @asynccontextmanager
     async def scan(
@@ -150,7 +215,11 @@ class QdrantIndex:
                         continue
                     candidate_id = payload.get("candidate_id")
                     revision = payload.get("revision")
-                    if not isinstance(candidate_id, str) or not candidate_id.strip():
+                    if (
+                        not isinstance(candidate_id, str)
+                        or not candidate_id.strip()
+                        or "\x00" in candidate_id
+                    ):
                         continue
                     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
                         continue
@@ -166,15 +235,16 @@ class QdrantIndex:
         scope: Scope,
         candidate_id: str,
         revision: int,
-        vector: Sequence[float],
+        vector: VectorLike,
         *,
-        evidence_id: str | None = None,
+        evidence_id: str,
+        prune_prior_revisions: bool = False,
     ) -> None:
+        """Project one candidate revision into Qdrant with mandatory evidence lineage."""
         _scope(scope)
         _nonempty("candidate_id", candidate_id)
         _revision(revision)
-        if evidence_id is not None:
-            _nonempty("evidence_id", evidence_id)
+        _nonempty("evidence_id", evidence_id)
         checked = _checked_vector(vector, self.profile.dimension)
         payload: dict[str, Any] = {
             "tenant_id": scope.tenant_id,
@@ -182,9 +252,8 @@ class QdrantIndex:
             "profile_id": self.profile.profile_id,
             "candidate_id": candidate_id,
             "revision": revision,
+            "evidence_id": evidence_id,
         }
-        if evidence_id is not None:
-            payload["evidence_id"] = evidence_id
         await self.client.upsert(
             collection_name=self.collection,
             points=[
@@ -196,6 +265,8 @@ class QdrantIndex:
             ],
             wait=True,
         )
+        if prune_prior_revisions and revision > 1:
+            await self.delete(scope, candidate_id, revision - 1)
 
     async def delete(self, scope: Scope, candidate_id: str, revision: int) -> None:
         _scope(scope)
@@ -271,3 +342,79 @@ class QdrantIndex:
             separators=(",", ":"),
         )
         return str(uuid5(_POINT_NAMESPACE, identity))
+
+
+async def reconcile_event(
+    memory: Memory,
+    index: QdrantIndex,
+    embed_candidate: Callable[[Candidate], Awaitable[VectorLike]],
+    event: IndexEvent,
+    *,
+    prune_prior_revisions: bool = True,
+) -> None:
+    """Re-read authoritative Aletora state and reconcile Qdrant for one ``IndexEvent``.
+
+    Call within a host-owned read transaction after dequeuing an outbox event.
+    Time-bounded validity windows (``valid_from``/``valid_until``) are enforced at
+    query time by ``Memory.retrieve`` rather than excluded from projection.
+    """
+    if not isinstance(index, QdrantIndex):
+        raise ValueError("index must be a QdrantIndex")
+    if not callable(embed_candidate):
+        raise ValueError("embed_candidate must be an async callable")
+    if not isinstance(event, IndexEvent):
+        raise ValueError("event must be an IndexEvent")
+    expected_kind = "evidence" if event.action is IndexAction.INVALIDATE_EVIDENCE else "candidate"
+    if event.kind != expected_kind:
+        raise ValueError(
+            f"{event.action.value} event requires kind {expected_kind!r}, got {event.kind!r}"
+        )
+
+    if event.action is IndexAction.INVALIDATE_EVIDENCE:
+        try:
+            evidence = await memory.get_evidence(event.scope, event.record_id)
+        except NotFound:
+            await index.delete_evidence(event.scope, event.record_id)
+            return
+        if evidence.state is EvidenceState.WITHDRAWN:
+            await index.delete_evidence(event.scope, event.record_id)
+        return
+
+    try:
+        candidate = await memory.get_candidate(event.scope, event.record_id)
+    except NotFound:
+        await index.delete(event.scope, event.record_id, event.revision)
+        return
+
+    if candidate.state is not GovernanceState.ACCEPTED or candidate.application is None:
+        await index.delete(event.scope, candidate.id, max(candidate.revision, event.revision))
+        return
+
+    try:
+        evidence = await memory.get_evidence(event.scope, candidate.evidence_id)
+    except NotFound:
+        await index.delete(event.scope, candidate.id, max(candidate.revision, event.revision))
+        return
+
+    if evidence.state is not EvidenceState.ACTIVE:
+        await index.delete(event.scope, candidate.id, max(candidate.revision, event.revision))
+        return
+
+    vector = await embed_candidate(candidate)
+    await index.upsert(
+        event.scope,
+        candidate.id,
+        candidate.revision,
+        vector,
+        evidence_id=candidate.evidence_id,
+        prune_prior_revisions=prune_prior_revisions,
+    )
+
+    # Invalidation may have completed while the embedding or upsert was in flight.
+    try:
+        evidence = await memory.get_evidence(event.scope, candidate.evidence_id)
+    except NotFound:
+        await index.delete(event.scope, candidate.id, candidate.revision)
+        return
+    if evidence.state is EvidenceState.WITHDRAWN:
+        await index.delete(event.scope, candidate.id, candidate.revision)

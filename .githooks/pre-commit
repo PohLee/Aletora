@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Format staged Python files with Ruff before each commit.
+#
+# The staged (index) version of each file is formatted and written back to the
+# index, so partially staged files never pick up unstaged edits. The working
+# tree copy is formatted too, so it matches what gets committed.
+set -euo pipefail
+
+if command -v uv >/dev/null 2>&1; then
+    ruff=(uv run --frozen ruff)
+elif command -v ruff >/dev/null 2>&1; then
+    ruff=(ruff)
+else
+    echo "pre-commit: neither uv nor ruff found on PATH; cannot format." >&2
+    exit 1
+fi
+
+formatted=0
+while IFS= read -r -d '' path; do
+    mode=$(git ls-files --stage -- "$path" | cut -d' ' -f1)
+    staged_blob=$(git rev-parse ":$path")
+
+    if ! new_blob=$(git cat-file blob "$staged_blob" \
+        | "${ruff[@]}" format --force-exclude --stdin-filename "$path" - \
+        | git hash-object -w --stdin --path "$path"); then
+        echo "pre-commit: ruff format failed on staged $path" >&2
+        exit 1
+    fi
+
+    if [ "$new_blob" != "$staged_blob" ]; then
+        git update-index --cacheinfo "$mode,$new_blob,$path"
+        formatted=$((formatted + 1))
+        echo "pre-commit: formatted $path"
+    fi
+
+    if [ -f "$path" ]; then
+        "${ruff[@]}" format --force-exclude --quiet "$path"
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.py' '*.pyi')
+
+if [ "$formatted" -gt 0 ]; then
+    echo "pre-commit: ruff formatted $formatted staged file(s)."
+fi

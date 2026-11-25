@@ -1,13 +1,16 @@
 """Transaction-aware in-memory RecordStore and EventSink test adapters.
 
 Both adapters share an ``InMemoryDatabase``. Its caller-owned transaction context
-stages a private snapshot, publishes it only on normal exit, and discards it on
-exception. A transaction is single-task and cannot be nested or concurrently reused.
+stages a shallow copy of committed tables (records and payloads are replaced rather
+than mutated in place, and events are frozen), publishes it only on normal exit,
+and discards it on exception. A transaction is single-task and cannot be nested or
+concurrently reused.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -40,9 +43,9 @@ class _TransactionContext:
             raise RuntimeError("an in-memory transaction requires an asyncio task")
         database._owner = task
         database._transaction = _Transaction(
-            deepcopy(database._records),
-            deepcopy(database._idempotency),
-            deepcopy(database._events),
+            dict(database._records),
+            dict(database._idempotency),
+            list(database._events),
         )
         return database
 
@@ -74,7 +77,7 @@ class InMemoryDatabase:
 
     @property
     def events(self) -> tuple[IndexEvent, ...]:
-        return tuple(deepcopy(self._events))
+        return tuple(self._events)
 
     def _require_transaction(self) -> _Transaction:
         transaction = self._transaction
@@ -96,6 +99,42 @@ class InMemoryRecordStore(RecordStore):
         transaction = self._database._require_transaction()
         stored = transaction.records.get((scope.tenant_id, scope.namespace, kind, record_id))
         return deepcopy(stored) if stored is not None else None
+
+    async def get_for_share(self, scope: Scope, kind: str, record_id: str) -> StoredRecord | None:
+        return await self.get(scope, kind, record_id, for_update=False)
+
+    async def get_many(
+        self, scope: Scope, kind: str, record_ids: Sequence[str]
+    ) -> dict[str, StoredRecord]:
+        transaction = self._database._require_transaction()
+        found: dict[str, StoredRecord] = {}
+        for record_id in dict.fromkeys(record_ids):
+            stored = transaction.records.get((scope.tenant_id, scope.namespace, kind, record_id))
+            if stored is not None:
+                found[record_id] = deepcopy(stored)
+        return found
+
+    async def list_records(
+        self,
+        scope: Scope,
+        kind: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredRecord, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        transaction = self._database._require_transaction()
+        matching = [
+            stored
+            for (tenant_id, namespace, rec_kind, record_id), stored in transaction.records.items()
+            if tenant_id == scope.tenant_id
+            and namespace == scope.namespace
+            and rec_kind == kind
+            and (after_id is None or record_id > after_id)
+        ]
+        matching.sort(key=lambda record: record.id)
+        return tuple(deepcopy(record) for record in matching[:limit])
 
     async def insert(
         self,
@@ -155,4 +194,4 @@ class InMemoryEventSink(EventSink):
         transaction = self._database._require_transaction()
         if self.failure is not None:
             raise self.failure
-        transaction.events.append(deepcopy(event))
+        transaction.events.append(event)

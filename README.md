@@ -2,13 +2,11 @@
 
 Aletora is a Python package for keeping source evidence, governing knowledge candidates, and retrieving only knowledge that the host application currently authorizes.
 
-It is designed to be as a dependency. Each application remains the authority for its own users, business records, authorization, database transactions, migrations, and background workers.
+Install Aletora as a dependency. Each application remains the authority for its own users, business records, authorization, database transactions, migrations, and background workers.
 
 Inspired by Greek aletheia (truth) and orchestration. Suggests an intelligence engine that turns trustworthy knowledge into action. Evidence into intelligence. Intelligence into action.
 
-
 > **V1 / experimental:** Aletora 0.1 has not been publicly released. Its adapter interfaces may still change.
-
 
 ## Ownership and architecture
 ~~~mermaid
@@ -29,8 +27,6 @@ A small interface concentrates lifecycle and retrieval checks in one deep module
 in-memory, SQLAlchemy and Tortoise adapters justify the persistence seam; callers and tests
 exercise the same interface. See [the specification](docs/V1-SPEC.md) and
 [ADR-0001](docs/adr/0001-host-owned-truth-and-transactions.md).
-
-
 
 ## How it fits into your application
 
@@ -60,9 +56,17 @@ Aletora does not extract documents, call an LLM, accept candidates automatically
 
 Your host creates Scope(tenant_id, namespace) only after authenticating and authorizing the caller. Scope keeps records separate; it is not an authentication token.
 
+## Host integration protocols
+
+The protocols in `aletora.ports` are also available from `aletora`.
+
+- `RecordStore` persists scoped evidence and candidates. The built-in stores also implement `ShareLockableRecordStore` for shared evidence locks, `BatchRecordStore` for batch reads, and `EnumerableRecordStore` for pagination.
+- `EventSink.append(event)` writes index events to the host outbox in the same transaction as the corresponding records.
+- `SearchIndex.scan(scope, query, *, budget)` provides bounded discovery. The request's `RecordResolver` authorizes each formal record. A `BatchRecordResolver` can authorize and load several exact versions in one call.
+
 ## Install
 
-Install from a checkout with the adapters you plan to use:
+With Python 3.12 or newer, install from a checkout with the adapters you plan to use:
 
 ~~~sh
 python -m pip install -e '.[sqlalchemy,qdrant]'
@@ -99,7 +103,7 @@ Your host also needs a durable outbox table for IndexEvent rows. Implement the s
 Extraction can come from a user, your application, a tool, or an external model. Store the source snapshot and the proposed meaning separately. The example below uses SQLAlchemy; HostOutbox represents your own EventSink implementation bound to the same session.
 
 ~~~python
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aletora import (
     EpistemicKind,
@@ -130,7 +134,7 @@ async def capture_and_propose(session, host_outbox, authorized_tenant, brand_id)
         ),
         content="The brand guide recommends short, direct headlines.",
         idempotency_key="brand-guidelines-2026-10-headlines-2",
-        captured_at=datetime.now(timezone.utc),
+        captured_at=datetime.now(UTC),
     )
     candidate = await memory.propose(
         scope,
@@ -141,7 +145,7 @@ async def capture_and_propose(session, host_outbox, authorized_tenant, brand_id)
             proposer_id="brand-editor-17",
             extractor_id="guideline-importer",
             run_id="import-2026-10-13",
-            proposed_at=datetime.now(timezone.utc),
+            proposed_at=datetime.now(UTC),
         ),
         idempotency_key="brand-guidelines-2026-10-short-headlines",
     )
@@ -157,7 +161,7 @@ async with session_factory.begin() as session:
     )
 ~~~
 
-The HostOutbox class is application code. It should persist each event's ID, scope, action, record kind, record ID, and revision using the supplied session. If anything fails, let the exception leave the transaction so PostgreSQL rolls back all writes.
+Use a transactional connection. The SQLAlchemy adapter rejects AUTOCOMMIT. The HostOutbox class is application code. It should persist each event's ID, scope, action, record kind, record ID, and revision using the supplied session. If anything fails, let the exception leave the transaction so PostgreSQL rolls back all writes.
 
 ## 3. Review, then apply to your formal record
 
@@ -277,6 +281,8 @@ await index.upsert(
 
 For a candidate deletion event, call index.delete(scope, candidate_id, terminal_revision). For evidence withdrawal, call index.delete_evidence(scope, evidence_id). Deduplicate outbox events, serialize projection updates for the same candidate where possible, and retry failed worker operations. Qdrant writes are not atomic with PostgreSQL; every retrieval therefore checks current revisions and evidence again. See [Qdrant integration](docs/QDRANT.md) for stale projection behavior, collection requirements and rebuild guidance.
 
+The worker can use `aletora.adapters.qdrant.reconcile_event` to re-read current records and apply the event. For a rebuild, use `Memory.list_candidates(scope, after_id=..., limit=...)` to page through candidates by ID. If independent applications share a collection, use globally unique scope identities or give each application its own collection.
+
 ## 5. Retrieve for an authorized request
 
 Bind the resolver to the current request's authenticated user. It must return only the exact current FormalRef that this user may read. Return None for a missing, changed, or unauthorized record.
@@ -324,10 +330,13 @@ async def answer_context(session, user, authorized_tenant, brand_id, index, prof
 
 Call answer_context inside the request's host transaction/session. Results contain the host-authorized formal content, exact reference, current candidate revision, epistemic kind, retrieval score, and source citations. A similarity hit is only a discovery hint. If the resolver returns a different version, or the candidate/evidence is stale, withdrawn, unreviewed, unapplied, or invalid, Memory filters it out. Adapter and resolver failures propagate; there is no fallback that returns unverified index text.
 
+Use `retrieve_with_stats(scope, query, limit=...)` to return the authorized hits and `RetrievalStats` counters together. A scan can return fewer hits than requested when it exhausts its budget. Treat evidence text and citation fields (`SourceRef.uri`, `locator`, and `source_id`) as untrusted input. Escape displayed values and allowlist link schemes such as HTTPS before rendering citations in a host UI.
+
 ## Lifecycle operations
 
 - record_evidence(scope, source, content, idempotency_key=...) records an immutable source snapshot and content hash.
 - propose(scope, evidence_id, proposal, idempotency_key=...) creates a Candidate in PROPOSED state.
+- `propose_many(scope, evidence_id, items)` creates multiple proposals against one evidence record while holding its lineage lock.
 - review(..., ACCEPTED | REJECTED, ..., expected_revision=...) records an attributable decision; it does not write a formal record.
 - record_application(scope, candidate_id, FormalRef(...), actor, expected_revision=...) records the host's successful formal write.
 - withdraw(..., expected_revision=...) and supersede(..., expected_revision=...) change candidate governance state with an audit reason.
@@ -345,9 +354,14 @@ uv run --frozen mypy
 uv run --frozen pytest
 ~~~
 
-PostgreSQL adapter tests require an isolated database in ALETORA_TEST_POSTGRES_DSN; see [development instructions](docs/DEVELOPMENT.md). The full verification gate tests Python 3.12 and 3.14 against real PostgreSQL and local-mode Qdrant. See [the validation record](docs/VALIDATION.md) for the tested versions and current integration limits.
-
+CI tests Python 3.12, 3.13, and 3.14 against PostgreSQL and Qdrant. To run the server tests locally, set `ALETORA_TEST_POSTGRES_DSN` and `ALETORA_TEST_QDRANT_URL` to isolated test services. See the [development instructions](docs/DEVELOPMENT.md), [validation record](docs/VALIDATION.md), and [domain glossary](GLOSSARY.md).
 
 ## License
 
 Apache-2.0.
+
+### Qdrant adapter migration
+
+`QdrantIndex.upsert` now requires the keyword-only `evidence_id` argument.
+Update direct callers to pass `evidence_id=candidate.evidence_id` and rebuild
+collections whose points lack this field. [Qdrant adapter guide](docs/QDRANT.md)

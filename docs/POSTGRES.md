@@ -3,29 +3,44 @@
 Aletora ships two optional adapters for its asynchronous `RecordStore` port:
 
 - `aletora.adapters.sqlalchemy.SQLAlchemyRecordStore` uses a caller-owned,
-  already-active SQLAlchemy `AsyncSession`.
+  already-active SQLAlchemy `AsyncSession` over a PostgreSQL dialect.
 - `aletora.adapters.tortoise.TortoiseRecordStore` uses the transaction wrapper
-  yielded by Tortoise `in_transaction()`, never a pooled client or bare
-  connection.
+  yielded by Tortoise `in_transaction()` on Tortoise's PostgreSQL `asyncpg`
+  backend, never a pooled client or bare connection.
+
+Both adapters also implement `ShareLockableRecordStore` (`get_for_share`),
+`BatchRecordStore` (`get_many`), and `EnumerableRecordStore` (`list_records`).
 
 Install the relevant extra (`aletora[sqlalchemy]` or `aletora[tortoise]`). The
 adapters execute on the supplied host transaction; they never commit, roll
 back, close it, allocate a pool, or do network/index work. Pass the transaction
 when constructing an adapter or per operation. The adapter raises if the
-SQLAlchemy session has no active transaction and rejects a bare Tortoise
-client. `schema=` accepts only a simple PostgreSQL identifier. Omit it to use
+SQLAlchemy session has no active transaction, uses a non-PostgreSQL dialect, or
+runs in AUTOCOMMIT, and rejects a bare Tortoise client or non-`asyncpg` wrapper.
+`schema=` accepts only a simple PostgreSQL identifier of 1–63 ASCII characters
+(`[A-Za-z_][A-Za-z0-9_]{0,62}`), matching PostgreSQL's `NAMEDATALEN - 1` limit so
+long schema names cannot be silently truncated into collisions. Omit it to use
 the caller's unchanged `search_path`.
 
-SQLAlchemy's `session.in_transaction()` describes an ORM logical transaction, which can exist even when the database is in AUTOCOMMIT. Before executing Aletora SQL, the adapter resolves the session's actual connection and checks its DBAPI transaction mode. AUTOCOMMIT is rejected rather than changed; an uninspectable mode also fails closed. Configure a transactional isolation level before beginning the host transaction. This applies to engine defaults, inherited execution options and explicitly bound connections; a connection override back to a transactional mode is allowed.
+SQLAlchemy's `session.in_transaction()` describes an ORM logical transaction,
+which can exist even when the database is in AUTOCOMMIT. Before executing
+Aletora SQL, the adapter resolves the session's actual connection, checks its
+PostgreSQL dialect, and checks its DBAPI transaction mode. AUTOCOMMIT is
+rejected rather than changed; an uninspectable mode also fails closed.
+Configure a transactional isolation level before beginning the host transaction.
+This applies to engine defaults, inherited execution options and explicitly
+bound connections; a connection override back to a transactional mode is
+allowed.
 
 Tortoise currently exposes no public check for whether its transaction wrapper
 is still active. To fail closed before every statement, the adapter checks the
-wrapper's PostgreSQL dialect and its `_finalized`, `transaction`, and
+wrapper's PostgreSQL `asyncpg` shape and its `_finalized`, `transaction`, and
 `_connection.is_in_transaction()` state. This intentionally narrow compatibility
 check uses Tortoise/asyncpg wrapper internals; it rejects wrappers that have not
-begun, have been finalized, or whose connection has been released. If a future
-Tortoise version changes that wrapper shape, the adapter errors rather than
-falling back to a pooled/autocommit connection.
+begun, have been finalized, or whose connection has been released, and raises
+`TypeError` for Tortoise's `psycopg` wrapper. If a future Tortoise version
+changes that wrapper shape, the adapter errors rather than falling back to a
+pooled/autocommit connection.
 
 ```python
 async with session_factory() as session:
@@ -53,10 +68,13 @@ and `render_migration`; pass `schema="..."` to qualify the table safely.
   schema.
 - `shared.sql` creates the same table, enables and forces row-level security,
   and installs a tenant policy using
-  `current_setting('app.current_tenant_id', true)`. Set this transaction-local
-  value after host authorization, e.g. `SET LOCAL app.current_tenant_id = ...`
-  or `set_config(..., true)`. Missing setting means no rows are visible and
-  writes fail the policy's `WITH CHECK`.
+  `NULLIF(current_setting('app.current_tenant_id', true), '')`. Set this
+  transaction-local value after host authorization, e.g.
+  `SET LOCAL app.current_tenant_id = ...` or `set_config(..., true)`. Never use
+  session-level `SET app.current_tenant_id` on pooled connections. Missing or
+  empty settings mean no rows are visible and writes fail the policy's
+  `WITH CHECK`. Both templates also enforce non-blank `CHECK` constraints (using the same whitespace set as Python's `str.strip()`) on
+  `tenant_id`, `namespace`, `kind`, `record_id`, and `idempotency_key`.
 
 RLS is defense in depth; every adapter query still scopes by tenant, namespace,
 kind, and record ID. Test shared-RLS behavior using a restricted role that is
@@ -83,11 +101,32 @@ raises `IdempotencyConflict`. `update` increments the revision only when the
 expected revision matches and distinguishes a missing/invisible scoped row
 (`NotFound`) from a lost compare-and-swap (`RevisionConflict`).
 
-## Concurrent supersession
+## Concurrent lineage and supersession locking
 
-`Memory.supersede` reads both candidates with `RecordStore.get(..., for_update=True)` in sorted record-ID order, then validates the locked states and the original candidate's expected revision. Both row locks remain owned by the host transaction until commit or rollback. A competing reciprocal supersession waits and then checks current state, so both requests cannot commit a replacement cycle. Read-only lookups do not acquire these locks.
+- New proposals and candidate mutations that check active evidence take a
+  shared evidence-row lock via `get_for_share` (`SELECT ... FOR SHARE`).
+  Matching proposal replays return after a lock-free candidate lookup.
+  Without `get_for_share`, the fallback is an exclusive `FOR UPDATE` lock,
+  which serializes new proposals referencing the same evidence.
+- `withdraw_evidence` takes `FOR UPDATE` before checking or updating the
+  evidence row. Avoid withdrawing evidence in a transaction that already
+  acquired a shared lock on that row. Concurrent lock upgrades can deadlock.
+  Hosts that combine these operations must be prepared to roll back and retry
+  the entire transaction.
+- `Memory.supersede` reads both candidates with `RecordStore.get(..., for_update=True)`
+  in sorted record-ID order, then validates the locked states and expected
+  revision, and then locks the replacement's evidence (`candidate -> evidence`
+  lock order). A competing reciprocal supersession waits and then checks current
+  state, so both requests cannot commit a replacement cycle. Ordinary
+  read-only lookups (`get_evidence`, `get_candidate`, `retrieve`) do not acquire
+  row locks.
 
-The ordering avoids opposite lock order within one supersession call. Hosts performing several operations or taking their own locks in a transaction must still handle PostgreSQL deadlock/serialization errors by rolling back and retrying the entire unit of work when appropriate; the library does not retry or commit part of it. Custom `RecordStore` implementations must honor `for_update` for concurrent storage. The supplied in-memory store already permits only one active owner.
+Hosts performing several operations or taking their own locks in a transaction
+must still handle PostgreSQL deadlock/serialization errors by rolling back and
+retrying the entire unit of work when appropriate; the library does not retry or
+commit part of it. Custom `RecordStore` implementations must honor `for_update`
+and optionally `get_for_share` for concurrent storage. The supplied in-memory
+store already permits only one active owner.
 
 ## Migration rollback
 

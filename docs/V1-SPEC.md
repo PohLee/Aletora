@@ -1,10 +1,10 @@
 # Aletora V1 implementation specification
 
-Status: implementation target approved in this session, 2026-10-13. Research documents remain evidence and recommendations, not implementation claims.
+This document records the approved V1 contract and invariants for `aletora`.
 
 ## Scope and exclusions
 
-Build an installable Python >=3.12 package `aletora`, verified on 3.12 and 3.14. Core has no third-party runtime dependencies. Optional extras: `sqlalchemy`, `tortoise`, `qdrant`; development dependencies include pytest, pytest-asyncio, Ruff, mypy and build tooling.
+The V1 contract is implemented by the unreleased `aletora` package version `0.1.0`. Package metadata requires Python >=3.12, and CI verifies Python 3.12, 3.13, and 3.14. The build produces a `py3-none-any` wheel and a source distribution. Core has no third-party runtime dependencies. Optional extras are `sqlalchemy`, `tortoise`, and `qdrant`.
 
 No edits to Impulsira/ServexaOS, no public release, no LLM provider, Docling, graph database, automated promotion, graph reasoning or mandatory vector backend. Hosts supply candidate proposals, embedding policy, current-record authorization and durable worker execution. Typed relationship candidates are deferred until a real caller/test requires them; do not build unused seams.
 
@@ -27,11 +27,11 @@ Tests cross the same interface as callers. Use vertical red-green slices, not te
 
 ## Public module
 
-`Memory` exposes `record_evidence`, `get_evidence`, `propose`, `get_candidate`, `review`, `record_application`, `withdraw`, `supersede`, `withdraw_evidence`, `retrieve`. This is the whole lifecycle module, not ten forwarding modules. Scope is explicit on each operation. Reads return immutable typed snapshots; mutation results expose revision.
+`Memory` exposes `record_evidence`, `get_evidence`, `propose`, `propose_many`, `get_candidate`, `list_candidates`, `review`, `record_application`, `withdraw`, `supersede`, `withdraw_evidence`, `retrieve`, `retrieve_with_stats`. This is the whole lifecycle module, not ten forwarding modules. Scope is explicit on each operation. Reads return immutable typed snapshots; mutation results expose revision.
 
-`propose` accepts one host-produced Proposal and one evidence ID; a host can loop within its transaction for a batch. Review records reviewer/reason/time; application records a FormalRef. Withdrawal/supersession record actor/reason/time. Evidence withdrawal rejects later proposals and blocks referencing hits.
+`propose` accepts one host-produced `Proposal` and one evidence ID. `propose_many(scope, evidence_id, items)` requires a sequence of `(Proposal, idempotency_key)` tuples and returns snapshots in input order. It rejects invalid items and same-key, different-content pairs before store access, then batch-reads existing candidates before writing. Matching fingerprints reuse stored snapshots. A conflicting fingerprint raises `IdempotencyConflict` before any insert. New candidates share one parent-evidence lock and are inserted in ascending record-ID order. The host must roll back the entire transaction on any exception, including conflicts detected by the store during concurrent inserts. Review records reviewer/reason/time, and application records a `FormalRef`. Withdrawal and supersession record actor/reason/time. Evidence withdrawal rejects later proposals and blocks referencing hits. `list_candidates(scope, *, after_id=None, limit=100)` paginates scoped candidates in ascending `record_id` order when the store implements `EnumerableRecordStore`.
 
-All candidate changes require `expected_revision`. Supersession requires a distinct, accepted replacement in the same Scope. Before checking either state, it locks both candidates in sorted record-ID order until the caller commits or rolls back; reciprocal concurrent supersession must not create a replacement cycle. Invalid transitions and invalid inputs raise typed errors. No state mutation on failed validation.
+Changes to existing candidates require `expected_revision`. `review`, `record_application`, and `supersede` acquire candidate row locks (`for_update=True`) before evidence locks (`get_for_share` or `for_update=True` fallback). Supersession requires a distinct, accepted replacement in the same Scope and locks both candidates in sorted record-ID order before validating states and replacement evidence. Invalid transitions and invalid inputs raise typed errors.
 
 ## Adapter contract
 
@@ -85,6 +85,14 @@ class RecordResolver(Protocol):
     async def resolve(self, scope: Scope, ref: FormalRef) -> ResolvedRecord | None: ...
 ```
 
+Optional extension protocols in `ports.py` and their fallbacks are:
+- `ShareLockableRecordStore.get_for_share(scope, kind, record_id)` (`SELECT ... FOR SHARE`)
+- `BatchRecordStore.get_many(scope, kind, record_ids)`
+- `EnumerableRecordStore.list_records(scope, kind, *, after_id=None, limit=100)`
+- `BatchRecordResolver.resolve_many(scope, refs)`
+
+Without the share-lock extension, lifecycle methods lock evidence with `RecordStore.get(..., for_update=True)`. Without a batch extension, retrieval calls the equivalent single-record method with per-call memoization. `list_candidates` requires the enumeration extension and raises `CapabilityUnavailable` when it is absent.
+
 `SearchIndex.scan` is a single-use, sequential discovery traversal. `budget` is a positive
 integer (excluding booleans) counting raw index points, including malformed, stale, duplicate
 and subsequently denied points. The adapter owns query preparation, raw pagination and
@@ -105,6 +113,8 @@ implement this contract. The unreleased 0.1 page-based `search(..., limit, offse
 
 `RecordStore.insert` returns the existing record with `created=False` for a matching idempotency key and fingerprint; a semantic mismatch raises `IdempotencyConflict`. PostgreSQL enforces atomic uniqueness. `update` increments revision atomically; missing records raise `NotFound`, stale revisions raise `RevisionConflict`. `EventSink` is supplied by the host on the same transaction. Events carry stable deduplication IDs and request candidate refresh/deletion or evidence invalidation; workers re-read current records before projection. Scope is mandatory and not caller-overridable in index filtering.
 
+`IndexEvent.id`, `kind`, and `record_id` must be nonblank strings without NUL bytes. Its revision must be a positive integer other than a boolean. Qdrant's `reconcile_event` requires kind `candidate` for refresh and delete, and kind `evidence` for invalidation. Reconciliation projects accepted, applied candidates with active evidence regardless of validity window. Retrieval evaluates the window against one per-call clock value, with inclusive `valid_from` and exclusive `valid_until`.
+
 ## Persistence and migrations
 
 Single prefixed `aletora_records` aggregate table: tenant_id, namespace, kind, record_id, idempotency_key, fingerprint, revision, payload(JSONB). Domain aggregates declare `schema_version=1`; missing/unknown/non-integer versions must fail explicitly rather than be silently reinterpreted. Composite primary key `(tenant_id, namespace, kind, record_id)` and unique `(tenant_id, namespace, kind, idempotency_key)`. Domain lineage checks performed by Memory against scoped evidence; no cross-tenant references. Concurrent duplicates use INSERT ON CONFLICT DO NOTHING then read the winner, not catch a transaction-aborting unique violation.
@@ -115,11 +125,20 @@ SQLAlchemy adapter requires an active supplied AsyncSession transaction and exec
 
 Retrieval returns only accepted, applied, currently valid candidates with active evidence. IndexHit revision must equal current candidate revision; profile must match configured profile. Host resolver must return exact current FormalRef and authorized content. Results contain formal content, candidate/ref/revision, epistemic kind, governance state, profile ID, citations and separate retrieval score; no raw candidate/evidence text or unverified index text enters context. Any adapter error propagates (no insecure fallback).
 
-Traverse the index within a documented finite raw-point budget to fill authorized result slots;
-limit is positive and bounded. The index adapter owns bounded pagination and exhaustion.
+Traverse the index within `Memory(..., scan_budget=200)` to fill authorized result slots.
+Both retrieval methods require a `limit` between 1 and 100. The index adapter owns bounded
+pagination and exhaustion.
 Memory consumes validated discoveries and stops as soon as enough authorized results exist. Deduplicate IDs; never return more than requested. Missing index or resolver raises an explicit capability error. A configured index returning no matches returns an empty result. A scan-budget shortfall may return fewer results, never unsafe results.
 
-Qdrant adapter receives caller-owned AsyncQdrantClient, explicit collection and versioned EmbeddingProfile (model, dimension, preprocessing/chunking versions). It uses an injected async embed callable for search; no supplier SDK. Worker-facing upsert/delete validate scope, dimensions, profile and candidate revision. Stable point ID includes Scope, candidate ID, profile and revision: retrying the same revision is idempotent, while a delayed older upsert cannot overwrite a newer revision. Candidate deletion requires a positive revision and removes only matching projections at or below it, never a newer revision. Exact payload tenant/namespace/profile filtering and current revision re-read during retrieval remain mandatory. Older revisions may persist and consume the finite scan budget until worker cleanup/rebuild; no strict recall-quality or physical-erasure guarantee is made. No automatic collection or network access on import. Worker retry/rebuild/delete, delayed old upsert/delete and profile mismatch tests use real local-mode Qdrant.
+`retrieve` returns `tuple[RetrievalHit, ...]`. `retrieve_with_stats` returns a `RetrievalResult`
+with the same hits and `RetrievalStats`. Each yielded `IndexHit` counts once in `hits_examined`
+and once as returned or skipped. In both batch and single-record retrieval, a profile mismatch
+or stale revision takes precedence over a duplicate of a returned candidate. Repeated hits for
+an expired candidate count separately under `validity_window_skipped`. The raw-point `budget`
+also covers malformed points discarded by the index, including Qdrant candidate IDs containing
+NUL bytes. Those points do not appear in `hits_examined`.
+
+Qdrant adapter receives caller-owned AsyncQdrantClient, explicit collection and versioned EmbeddingProfile (model, dimension, preprocessing/chunking versions). It uses an injected async embed callable for search; no supplier SDK. `ensure_collection()` creates payload indexes for `tenant_id` (`is_tenant=True`), `namespace`, `profile_id`, `candidate_id`, `evidence_id`, and `revision`. Worker-facing upsert/delete validate scope, dimensions, profile, candidate revision, and required `evidence_id` (with optional `prune_prior_revisions`), and `reconcile_event` implements authoritative worker reconciliation. Stable point ID includes Scope, candidate ID, profile and revision: retrying the same revision is idempotent, while a delayed older upsert cannot overwrite a newer revision. Candidate deletion requires a positive revision and removes only matching projections at or below it, never a newer revision. Exact payload tenant/namespace/profile filtering and current revision re-read during retrieval remain mandatory. Older revisions may persist and consume the finite scan budget until worker cleanup/rebuild; no strict recall-quality or physical-erasure guarantee is made. No automatic collection or network access on import. Worker retry/rebuild/delete, delayed old upsert/delete and profile mismatch tests use real local-mode Qdrant and server-mode CI Qdrant.
 
 ## Verification gates
 
@@ -128,15 +147,6 @@ Qdrant adapter receives caller-owned AsyncQdrantClient, explicit collection and 
 - Host rollback covers Aletora evidence/candidate/application and durable host outbox, including sink failure. Adapters never commit. SQLAlchemy rejects AUTOCOMMIT from engine or connection configuration before writes, while a connection explicitly restored to transactional mode remains usable.
 - Shared tenant RLS using restricted DB role; dedicated schemas with same logical IDs; caller search_path preserved.
 - Retrieval denies stale revision/profile/ref, withdrawn/deleted/expired/unapplied data, wrong tenant/namespace, denied role; rejected hits do not consume the first page's return slots.
-- Qdrant local mode scoped upsert/scan/delete/retry/rebuild; one embedding across multiple raw pages, malformed-point budget accounting, early stop and independent concurrent traversals. Context cleanup covers errors and cancellation; no live Qdrant-service performance claim.
+- Qdrant local and server modes: scoped upsert/scan/delete/retry/rebuild; payload index creation; one embedding across multiple raw pages, malformed-point budget accounting, early stop and independent concurrent traversals. Context cleanup covers errors and cancellation; no live Qdrant-service performance SLO claim.
 - Shared real-host transaction scenarios run against both SQLAlchemy and Tortoise, observing committed records, formal writes and durable outbox events from an independent connection. Adapter-specific mode, RLS and connection checks remain explicit.
-- Python 3.12 and 3.14 full suite, Ruff, typecheck, wheel/sdist, core-only import/install smoke. CI retains real PostgreSQL gates.
-
-## Task map
-
-1. TL: establish scope/spec/glossary/ADR and frozen contract; review each handoff.
-2. Core agent: immutable domain types, errors, ports, Memory lifecycle/retrieval, in-memory transaction adapter, vertical behavior tests.
-3. Packaging agent: dependency extras, package build, development setup and CI; independent file ownership.
-4. PostgreSQL agent: two concrete transaction adapters, reusable SQL template/RLS, contract and transaction tests against isolated PostgreSQL.
-5. Qdrant agent: optional projection adapter and local-mode behavior tests.
-6. TL + independent review agents: standards/spec/security review; dispatch fixes; execute final gates; document precise validation scope and commit only created implementation files (not pre-existing untracked research).
+- Python 3.12, 3.13, and 3.14 full suite, Ruff, strict mypy across source and tests, wheel/sdist, core-only import/install smoke. CI retains real PostgreSQL and Qdrant gates.

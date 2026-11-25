@@ -1,6 +1,6 @@
 """Host transaction guarantees exercised identically through both real adapters."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from postgres_host import HostTransaction, PostgresHost
@@ -21,7 +21,7 @@ from aletora.ports import IndexAction
 
 pytestmark = [pytest.mark.postgres, pytest.mark.asyncio]
 SCOPE = Scope("tenant", "host-transactions")
-STAMP = datetime(2026, 10, 13, tzinfo=timezone.utc)
+STAMP = datetime(2026, 10, 13, tzinfo=UTC)
 REF = FormalRef("host", "rule", "formal-1", "v1")
 
 

@@ -4,22 +4,25 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
 from .errors import IdempotencyConflict, NotFound, RevisionConflict
 from .models import Scope
 from .ports import InsertResult, StoredRecord
 
-_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+# PostgreSQL limits identifiers (NAMEDATALEN - 1) to 63 bytes; longer names
+# would be silently truncated and could collide across dedicated schemas.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
 Executor = Callable[[str, dict[str, Any]], Awaitable[Mapping[str, Any] | None]]
+ManyExecutor = Callable[[str, dict[str, Any]], Awaitable[Sequence[Mapping[str, Any]]]]
 
 
 def qualified_table(schema: str | None) -> str:
     if schema is None:
         return '"aletora_records"'
     if not isinstance(schema, str) or not _IDENTIFIER.fullmatch(schema):
-        raise ValueError("schema must be a simple PostgreSQL identifier")
+        raise ValueError("schema must be a simple PostgreSQL identifier (1-63 ASCII chars)")
     return f'"{schema}"."aletora_records"'
 
 
@@ -42,6 +45,14 @@ def _scope_params(scope: Scope, kind: str, record_id: str) -> dict[str, Any]:
     }
 
 
+def _kind_params(scope: Scope, kind: str) -> dict[str, Any]:
+    return {
+        "tenant_id": scope.tenant_id,
+        "namespace": scope.namespace,
+        "kind": kind,
+    }
+
+
 class PostgresRecordContract:
     """SQL and state mapping shared by transaction-specific frontends."""
 
@@ -54,6 +65,14 @@ class PostgresRecordContract:
             f"SELECT record_id, revision, payload FROM {self.table} "
             "WHERE tenant_id=:tenant_id AND namespace=:namespace "
             "AND kind=:kind AND record_id=:record_id"
+        )
+
+    @property
+    def get_many_sql(self) -> str:
+        return (
+            f"SELECT record_id, revision, payload FROM {self.table} "
+            "WHERE tenant_id=:tenant_id AND namespace=:namespace "
+            "AND kind=:kind AND record_id = ANY(CAST(:record_ids AS text[]))"
         )
 
     @property
@@ -106,6 +125,63 @@ class PostgresRecordContract:
         statement = self.get_sql + (" FOR UPDATE" if for_update else "")
         row = await execute(statement, _scope_params(scope, kind, record_id))
         return decode_record(row) if row is not None else None
+
+    async def get_for_share(
+        self,
+        execute: Executor,
+        scope: Scope,
+        kind: str,
+        record_id: str,
+    ) -> StoredRecord | None:
+        statement = self.get_sql + " FOR SHARE"
+        row = await execute(statement, _scope_params(scope, kind, record_id))
+        return decode_record(row) if row is not None else None
+
+    async def get_many(
+        self,
+        execute_many: ManyExecutor,
+        scope: Scope,
+        kind: str,
+        record_ids: Sequence[str],
+    ) -> dict[str, StoredRecord]:
+        unique_ids = list(dict.fromkeys(record_ids))
+        if not unique_ids:
+            return {}
+        params = _kind_params(scope, kind)
+        params["record_ids"] = unique_ids
+        rows = await execute_many(self.get_many_sql, params)
+        records = [decode_record(row) for row in rows]
+        return {record.id: record for record in records}
+
+    async def list_records(
+        self,
+        execute_many: ManyExecutor,
+        scope: Scope,
+        kind: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredRecord, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        params = _kind_params(scope, kind)
+        params["limit"] = limit
+        if after_id is not None:
+            params["after_id"] = after_id
+            statement = (
+                f"SELECT record_id, revision, payload FROM {self.table} "
+                "WHERE tenant_id=:tenant_id AND namespace=:namespace "
+                "AND kind=:kind AND record_id > :after_id "
+                "ORDER BY record_id ASC LIMIT :limit"
+            )
+        else:
+            statement = (
+                f"SELECT record_id, revision, payload FROM {self.table} "
+                "WHERE tenant_id=:tenant_id AND namespace=:namespace "
+                "AND kind=:kind ORDER BY record_id ASC LIMIT :limit"
+            )
+        rows = await execute_many(statement, params)
+        return tuple(decode_record(row) for row in rows)
 
     async def insert(
         self,

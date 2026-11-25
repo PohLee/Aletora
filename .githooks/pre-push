@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Block pushes when any file in the repository fails `ruff format --check`.
+# This checks the working tree; commit or stash local edits first if they
+# differ from what you are pushing.
+set -euo pipefail
+
+if command -v uv >/dev/null 2>&1; then
+    ruff=(uv run --frozen ruff)
+elif command -v ruff >/dev/null 2>&1; then
+    ruff=(ruff)
+else
+    echo "pre-push: neither uv nor ruff found on PATH; cannot check formatting." >&2
+    exit 1
+fi
+
+if ! "${ruff[@]}" format --check .; then
+    echo >&2
+    echo "pre-push: formatting check failed; push blocked." >&2
+    echo "pre-push: run 'uv run --frozen ruff format .', commit, and push again." >&2
+    exit 1
+fi

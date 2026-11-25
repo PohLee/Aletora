@@ -7,19 +7,25 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import Enum, StrEnum
+
+
+def _no_nul(name: str, value: str) -> None:
+    if "\x00" in value:
+        raise ValueError(f"{name} must not contain NUL bytes")
 
 
 def _text(name: str, value: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+    _no_nul(name, value)
 
 
 def _utc(name: str, value: datetime) -> None:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{name} must be a timezone-aware datetime")
-    if value.utcoffset() != timezone.utc.utcoffset(value):
+    if value.utcoffset() != UTC.utcoffset(value):
         raise ValueError(f"{name} must be expressed in UTC")
 
 
@@ -42,20 +48,20 @@ def _validity_window(valid_from: datetime | None, valid_until: datetime | None) 
         raise ValueError("valid_from must precede valid_until")
 
 
-class SourceKind(str, Enum):
+class SourceKind(StrEnum):
     EXPLICIT_USER = "explicit_user"
     DOCUMENT = "document"
     TOOL = "tool"
     MODEL = "model"
 
 
-class EpistemicKind(str, Enum):
+class EpistemicKind(StrEnum):
     ASSERTED = "asserted"
     INFERRED = "inferred"
     QUESTION = "question"
 
 
-class GovernanceState(str, Enum):
+class GovernanceState(StrEnum):
     PROPOSED = "proposed"
     ACCEPTED = "accepted"
     REJECTED = "rejected"
@@ -63,7 +69,7 @@ class GovernanceState(str, Enum):
     SUPERSEDED = "superseded"
 
 
-class EvidenceState(str, Enum):
+class EvidenceState(StrEnum):
     ACTIVE = "active"
     WITHDRAWN = "withdrawn"
 
@@ -92,6 +98,13 @@ class Scope:
 
 @dataclass(frozen=True, slots=True)
 class SourceRef:
+    """Provenance locator for recorded evidence.
+
+    ``source_id``, ``locator``, and ``uri`` are unvalidated, untrusted strings from
+    evidence ingestion. Host UIs rendering links must allowlist URI schemes
+    (for example ``http:`` and ``https:``) and escape citation fields.
+    """
+
     kind: SourceKind
     source_id: str
     version: str
@@ -124,6 +137,7 @@ class Evidence:
             raise ValueError("scope and source must be typed values")
         if not isinstance(self.content, str):
             raise ValueError("content must be a string")
+        _no_nul("content", self.content)
         if not isinstance(self.content_hash, str) or not re.fullmatch(
             r"[0-9a-f]{64}", self.content_hash
         ):
@@ -181,6 +195,7 @@ class ResolvedRecord:
             raise ValueError("ref must be a FormalRef")
         if not isinstance(self.content, str):
             raise ValueError("content must be a string")
+        _no_nul("content", self.content)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +262,12 @@ class Candidate:
             raise ValueError("application must be an ApplicationReceipt")
         if self.replacement_id is not None:
             _text("replacement_id", self.replacement_id)
+            if self.replacement_id == self.id:
+                raise ValueError("candidate cannot supersede itself")
+        if (self.state is GovernanceState.SUPERSEDED) != (self.replacement_id is not None):
+            raise ValueError("superseded candidates require a replacement_id and vice versa")
+        if self.state is not GovernanceState.PROPOSED and not self.history:
+            raise ValueError("non-proposed candidates require governance history")
         if self.application is not None and self.state not in (
             GovernanceState.ACCEPTED,
             GovernanceState.SUPERSEDED,
@@ -316,6 +337,7 @@ class RetrievalHit:
             raise ValueError("ref must be a FormalRef")
         if not isinstance(self.content, str):
             raise ValueError("content must be a string")
+        _no_nul("content", self.content)
         if not isinstance(self.citations, tuple) or not all(
             isinstance(c, Citation) for c in self.citations
         ):
@@ -350,3 +372,65 @@ class IndexHit:
         ):
             raise ValueError("score must be finite")
         _text("profile_id", self.profile_id)
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalStats:
+    """Classify each yielded discovery once, as returned or skipped for one reason.
+
+    Profile and revision mismatches take precedence over duplicates of returned
+    candidates. ``budget`` also bounds raw points discarded by the index before
+    yielding, which are excluded from ``hits_examined`` and the skip counters.
+    """
+
+    hits_examined: int
+    duplicate_skipped: int
+    profile_mismatch_skipped: int
+    not_found_skipped: int
+    stale_revision_skipped: int
+    ineligible_state_skipped: int
+    unapplied_skipped: int
+    validity_window_skipped: int
+    inactive_evidence_skipped: int
+    resolver_denied_skipped: int
+    returned: int
+    budget: int
+    limit_reached: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "hits_examined",
+            "duplicate_skipped",
+            "profile_mismatch_skipped",
+            "not_found_skipped",
+            "stale_revision_skipped",
+            "ineligible_state_skipped",
+            "unapplied_skipped",
+            "validity_window_skipped",
+            "inactive_evidence_skipped",
+            "resolver_denied_skipped",
+            "returned",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if isinstance(self.budget, bool) or not isinstance(self.budget, int) or self.budget < 1:
+            raise ValueError("budget must be a positive integer")
+        if not isinstance(self.limit_reached, bool):
+            raise ValueError("limit_reached must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalResult:
+    """Authorized retrieval hits paired with bounded-scan diagnostic counters."""
+
+    hits: tuple[RetrievalHit, ...]
+    stats: RetrievalStats
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.hits, tuple) or not all(
+            isinstance(hit, RetrievalHit) for hit in self.hits
+        ):
+            raise ValueError("hits must be a tuple of RetrievalHit values")
+        if not isinstance(self.stats, RetrievalStats):
+            raise ValueError("stats must be a RetrievalStats")
