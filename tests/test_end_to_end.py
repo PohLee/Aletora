@@ -1,16 +1,18 @@
-"""One composed PostgreSQL lifecycle, Qdrant projection, and authorized retrieval case."""
+"""Composed PostgreSQL lifecycle, Qdrant projection, and authorized retrieval tests."""
 
 from __future__ import annotations
 
 import os
 import re
 import uuid
-from datetime import datetime, timezone
+from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from aletora import (
+    Candidate,
     EmbeddingProfile,
     EpistemicKind,
     FormalRef,
@@ -23,7 +25,7 @@ from aletora import (
     SourceRef,
 )
 
-NOW = datetime(2026, 10, 13, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 13, tzinfo=UTC)
 PROFILE = EmbeddingProfile("golden-embed", 3, "golden-preprocess-v1", "golden-chunks-v1")
 POSTGRES_DSN = os.environ.get("ALETORA_TEST_POSTGRES_DSN")
 
@@ -36,6 +38,11 @@ def _sqlalchemy_dsn(dsn: str) -> str:
     if dsn.startswith(("postgresql://", "postgres://")):
         return re.sub(r"^postgres(?:ql)?://", "postgresql+asyncpg://", dsn)
     return dsn
+
+
+def _tortoise_dsn(dsn: str) -> str:
+    dsn = re.sub(r"^postgresql\+asyncpg://", "postgres://", dsn)
+    return re.sub(r"^postgresql://", "postgres://", dsn)
 
 
 @pytest.fixture
@@ -61,23 +68,19 @@ async def composition_schema():
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", ["sqlalchemy", "tortoise"])
 async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
-    composition_schema: str,
-):
+    composition_schema: str, adapter: str
+) -> None:
     if POSTGRES_DSN is None:
         pytest.skip("ALETORA_TEST_POSTGRES_DSN is not configured")
-    pytest.importorskip("sqlalchemy")
+    pytest.importorskip(adapter)
     pytest.importorskip("qdrant_client")
     from qdrant_client import AsyncQdrantClient
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    from aletora.adapters.qdrant import QdrantIndex
-    from aletora.adapters.sqlalchemy import SQLAlchemyRecordStore
+    from aletora.adapters.qdrant import QdrantIndex, reconcile_event
 
     schema = composition_schema
-    engine = create_async_engine(_sqlalchemy_dsn(POSTGRES_DSN))
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
     qdrant = AsyncQdrantClient(":memory:")
     host_formal = f'"{schema}"."host_formal"'
     host_outbox = f'"{schema}"."host_outbox"'
@@ -86,37 +89,97 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
     formal_text = "Only the host-authorized, versioned policy is returned."
     ref = FormalRef("host-system", "policy", "policy-42", "v1")
 
-    class HostOutbox:
-        """Host durability fixture writing through the caller's session."""
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(qdrant.close)
+        if adapter == "sqlalchemy":
+            from sqlalchemy import text
+            from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-        def __init__(self, session: Any) -> None:
-            self.session = session
+            from aletora.adapters.sqlalchemy import SQLAlchemyRecordStore
 
-        async def append(self, event: Any) -> None:
-            await self.session.execute(
-                text(f"INSERT INTO {host_outbox} (event_id, action) VALUES (:id, :action)"),
-                {"id": event.id, "action": event.action.value},
-            )
+            engine = create_async_engine(_sqlalchemy_dsn(POSTGRES_DSN))
+            stack.push_async_callback(engine.dispose)
+            sessions = async_sessionmaker(engine, expire_on_commit=False)
 
-    class RequestFormalResolver:
-        """A request-bound host resolver enforcing scope, exact version, and role."""
+            async def run_sql(
+                session: Any, statement: str, params: dict[str, Any] | None = None
+            ) -> list[dict[str, Any]]:
+                res = await session.execute(text(statement), params or {})
+                if res.returns_rows:
+                    return [dict(row) for row in res.mappings().all()]
+                return []
 
-        def __init__(self, session: Any, role: str) -> None:
-            self.session = session
-            self.role = role
+            def make_store(session: Any) -> Any:
+                return SQLAlchemyRecordStore(session, schema=schema)
 
-        async def resolve(self, request_scope: Scope, formal_ref: FormalRef):
-            if self.role != "policy-reader":
-                return None
-            row = (
-                await self.session.execute(
-                    text(
-                        f"SELECT content FROM {host_formal} "
-                        "WHERE tenant_id = :tenant AND namespace = :namespace "
-                        "AND owner = :owner AND object_type = :object_type "
-                        "AND object_id = :object_id AND version = :version "
-                        "AND allowed_role = :role"
-                    ),
+            @asynccontextmanager
+            async def host_tx():
+                async with sessions.begin() as session:
+                    yield session
+
+        else:
+            from tortoise import Tortoise
+            from tortoise.transactions import in_transaction
+
+            from aletora.adapters.tortoise import TortoiseRecordStore
+
+            await Tortoise.init(db_url=_tortoise_dsn(POSTGRES_DSN), modules={"models": []})
+            stack.push_async_callback(Tortoise.close_connections)
+
+            async def run_sql(
+                session: Any, statement: str, params: dict[str, Any] | None = None
+            ) -> list[dict[str, Any]]:
+                values: list[Any] = []
+                bound = params or {}
+
+                def positional(match: re.Match[str]) -> str:
+                    values.append(bound[match.group(1)])
+                    return f"${len(values)}"
+
+                query = re.sub(r"(?<!:):([a-z_][a-z0-9_]*)", positional, statement)
+                rows: list[dict[str, Any]] = await session.execute_query_dict(query, values)
+                return rows
+
+            def make_store(session: Any) -> Any:
+                return TortoiseRecordStore(session, schema=schema)
+
+            @asynccontextmanager
+            async def host_tx():
+                async with in_transaction() as connection:
+                    yield connection
+
+        class HostOutbox:
+            """Host durability fixture writing through the caller's transaction."""
+
+            def __init__(self, session: Any) -> None:
+                self.session = session
+
+            async def append(self, event: Any) -> None:
+                await run_sql(
+                    self.session,
+                    f"INSERT INTO {host_outbox} (event_id, action) VALUES (:id, :action)",
+                    {"id": event.id, "action": event.action.value},
+                )
+
+        class RequestFormalResolver:
+            """A request-bound host resolver enforcing scope, exact version, and role."""
+
+            def __init__(self, session: Any, role: str) -> None:
+                self.session = session
+                self.role = role
+
+            async def resolve(
+                self, request_scope: Scope, formal_ref: FormalRef
+            ) -> ResolvedRecord | None:
+                if self.role != "policy-reader":
+                    return None
+                rows = await run_sql(
+                    self.session,
+                    f"SELECT content FROM {host_formal} "
+                    "WHERE tenant_id = :tenant AND namespace = :namespace "
+                    "AND owner = :owner AND object_type = :object_type "
+                    "AND object_id = :object_id AND version = :version "
+                    "AND allowed_role = :role",
                     {
                         "tenant": request_scope.tenant_id,
                         "namespace": request_scope.namespace,
@@ -127,39 +190,34 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
                         "role": self.role,
                     },
                 )
-            ).first()
-            if row is None:
-                return None
-            return ResolvedRecord(formal_ref, row.content)
+                if not rows:
+                    return None
+                return ResolvedRecord(formal_ref, rows[0]["content"])
 
-    async def embed(_query: str) -> list[float]:
-        return [1.0, 0.0, 0.0]
+        async def embed(_query: str) -> list[float]:
+            return [1.0, 0.0, 0.0]
 
-    index = QdrantIndex(qdrant, "aletora-e2e", PROFILE, embed)
-    try:
+        async def embed_candidate(_candidate: Candidate) -> list[float]:
+            return [1.0, 0.0, 0.0]
+
+        index = QdrantIndex(qdrant, f"aletora-e2e-{adapter}", PROFILE, embed)
         await index.ensure_collection()
-        async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    f"CREATE TABLE {host_formal} ("
-                    "tenant_id text NOT NULL, namespace text NOT NULL, owner text NOT NULL, "
-                    "object_type text NOT NULL, object_id text NOT NULL, version text NOT NULL, "
-                    "content text NOT NULL, allowed_role text NOT NULL, "
-                    "PRIMARY KEY (tenant_id, namespace, owner, object_type, object_id, version))"
-                )
+        async with host_tx() as session:
+            await run_sql(
+                session,
+                f"CREATE TABLE {host_formal} ("
+                "tenant_id text NOT NULL, namespace text NOT NULL, owner text NOT NULL, "
+                "object_type text NOT NULL, object_id text NOT NULL, version text NOT NULL, "
+                "content text NOT NULL, allowed_role text NOT NULL, "
+                "PRIMARY KEY (tenant_id, namespace, owner, object_type, object_id, version))",
             )
-            await connection.execute(
-                text(
-                    f"CREATE TABLE {host_outbox} (event_id text PRIMARY KEY, action text NOT NULL)"
-                )
+            await run_sql(
+                session,
+                f"CREATE TABLE {host_outbox} (event_id text PRIMARY KEY, action text NOT NULL)",
             )
 
-        async with sessions.begin() as session:
-            memory = Memory(
-                SQLAlchemyRecordStore(session, schema=schema),
-                HostOutbox(session),
-                clock=lambda: NOW,
-            )
+        async with host_tx() as session:
+            memory = Memory(make_store(session), HostOutbox(session), clock=lambda: NOW)
             evidence = await memory.record_evidence(
                 scope,
                 SourceRef(SourceKind.DOCUMENT, "approved-policy-source", "v3", "section:4"),
@@ -188,13 +246,12 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
                 "checked against the source",
                 expected_revision=candidate.revision,
             )
-            await session.execute(
-                text(
-                    f"INSERT INTO {host_formal} "
-                    "(tenant_id, namespace, owner, object_type, object_id, version, content, "
-                    "allowed_role) VALUES (:tenant, :namespace, :owner, :object_type, "
-                    ":object_id, :version, :content, :role)"
-                ),
+            await run_sql(
+                session,
+                f"INSERT INTO {host_formal} "
+                "(tenant_id, namespace, owner, object_type, object_id, version, content, "
+                "allowed_role) VALUES (:tenant, :namespace, :owner, :object_type, "
+                ":object_id, :version, :content, :role)",
                 {
                     "tenant": scope.tenant_id,
                     "namespace": scope.namespace,
@@ -214,41 +271,30 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
                 expected_revision=candidate.revision,
             )
 
-        # Independent host-side read verifies that the formal write and outbox
-        # entries were committed alongside the Memory records.
-        async with sessions.begin() as session:
-            host_record = (await session.execute(text(f"SELECT content FROM {host_formal}"))).one()
-            event_count = (
-                await session.execute(text(f"SELECT count(*) FROM {host_outbox}"))
-            ).scalar_one()
-        assert host_record.content == formal_text
-        assert event_count == 2
+        # Independent host-side read verifies formal write and outbox entries committed.
+        async with host_tx() as session:
+            formal_rows = await run_sql(session, f"SELECT content FROM {host_formal}")
+            count_rows = await run_sql(session, f"SELECT count(*) AS cnt FROM {host_outbox}")
+        assert formal_rows[0]["content"] == formal_text
+        assert count_rows[0]["cnt"] == 2
 
-        # A worker uses the public Memory snapshots as source of truth before
-        # projecting the accepted/applied revision into the real local Qdrant.
-        async with sessions.begin() as session:
-            worker = Memory(
-                SQLAlchemyRecordStore(session, schema=schema),
-                HostOutbox(session),
-                clock=lambda: NOW,
-            )
-            projected_candidate = await worker.get_candidate(scope, applied.id)
-            projected_evidence = await worker.get_evidence(scope, evidence.id)
-            assert projected_candidate.state is GovernanceState.ACCEPTED
-            assert projected_candidate.application.ref == ref
-            assert projected_evidence.state.value == "active"
+        # Worker enumerates authoritative records and projects via reconcile_event.
+        async with host_tx() as session:
+            worker = Memory(make_store(session), HostOutbox(session), clock=lambda: NOW)
+            listed = await worker.list_candidates(scope, limit=10)
+            assert [c.id for c in listed] == [applied.id]
             await index.upsert(
                 scope,
-                projected_candidate.id,
-                projected_candidate.revision,
-                [1.0, 0.0, 0.0],
-                evidence_id=projected_evidence.id,
+                listed[0].id,
+                listed[0].revision,
+                await embed_candidate(listed[0]),
+                evidence_id=evidence.id,
             )
 
         async def retrieve(request_scope: Scope, role: str):
-            async with sessions.begin() as session:
+            async with host_tx() as session:
                 request_memory = Memory(
-                    SQLAlchemyRecordStore(session, schema=schema),
+                    make_store(session),
                     HostOutbox(session),
                     index=index,
                     resolver=RequestFormalResolver(session, role),
@@ -274,31 +320,28 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
         assert await retrieve(Scope(scope.tenant_id, "other-namespace"), "policy-reader") == ()
         assert await retrieve(scope, "unauthorized-role") == ()
 
-        # A projection is only a hint: a changed formal version and then a
-        # deleted formal object both fail the host's exact-reference check.
-        async with sessions.begin() as session:
-            await session.execute(
-                text(f"UPDATE {host_formal} SET version = 'v2' WHERE object_id = :id"),
+        async with host_tx() as session:
+            await run_sql(
+                session,
+                f"UPDATE {host_formal} SET version = 'v2' WHERE object_id = :id",
                 {"id": ref.object_id},
             )
         assert await retrieve(scope, "policy-reader") == ()
-        async with sessions.begin() as session:
-            await session.execute(
-                text(f"DELETE FROM {host_formal} WHERE object_id = :id"),
+        async with host_tx() as session:
+            await run_sql(
+                session,
+                f"DELETE FROM {host_formal} WHERE object_id = :id",
                 {"id": ref.object_id},
             )
         assert await retrieve(scope, "policy-reader") == ()
 
-        # Restore only the host fixture so evidence withdrawal is independently
-        # exercised against a still-resolvable formal record and stale Qdrant point.
-        async with sessions.begin() as session:
-            await session.execute(
-                text(
-                    f"INSERT INTO {host_formal} "
-                    "(tenant_id, namespace, owner, object_type, object_id, version, content, "
-                    "allowed_role) VALUES (:tenant, :namespace, :owner, :object_type, "
-                    ":object_id, :version, :content, :role)"
-                ),
+        async with host_tx() as session:
+            await run_sql(
+                session,
+                f"INSERT INTO {host_formal} "
+                "(tenant_id, namespace, owner, object_type, object_id, version, content, "
+                "allowed_role) VALUES (:tenant, :namespace, :owner, :object_type, "
+                ":object_id, :version, :content, :role)",
                 {
                     "tenant": scope.tenant_id,
                     "namespace": scope.namespace,
@@ -310,11 +353,7 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
                     "role": "policy-reader",
                 },
             )
-            withdrawal_memory = Memory(
-                SQLAlchemyRecordStore(session, schema=schema),
-                HostOutbox(session),
-                clock=lambda: NOW,
-            )
+            withdrawal_memory = Memory(make_store(session), HostOutbox(session), clock=lambda: NOW)
             await withdrawal_memory.withdraw_evidence(
                 scope,
                 evidence.id,
@@ -324,10 +363,23 @@ async def test_postgres_memory_qdrant_and_request_bound_host_resolution_compose(
             )
 
         assert await retrieve(scope, "policy-reader") == ()
-        await index.delete_evidence(scope, evidence.id)
+        async with host_tx() as session:
+            worker = Memory(make_store(session), HostOutbox(session), clock=lambda: NOW)
+            from aletora.ports import IndexAction, IndexEvent
+
+            await reconcile_event(
+                worker,
+                index,
+                embed_candidate,
+                IndexEvent(
+                    "invalidate-e2e",
+                    scope,
+                    IndexAction.INVALIDATE_EVIDENCE,
+                    "evidence",
+                    evidence.id,
+                    evidence.revision + 1,
+                ),
+            )
         async with index.scan(scope, "approval policy", budget=5) as discovery:
             assert [hit async for hit in discovery] == []
         assert await retrieve(scope, "policy-reader") == ()
-    finally:
-        await qdrant.close()
-        await engine.dispose()

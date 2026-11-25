@@ -6,7 +6,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -86,7 +86,7 @@ async def seed_candidate(sessions: Any, schema: str) -> tuple[Scope, Any]:
                 "proposer",
                 "extractor",
                 "run-1",
-                datetime(2026, 10, 13, tzinfo=timezone.utc),
+                datetime(2026, 10, 13, tzinfo=UTC),
             ),
             idempotency_key="candidate",
         )
@@ -192,7 +192,7 @@ async def test_sqlalchemy_preserves_review_and_outbox_atomicity_in_each_transact
         async with sessions.begin() as session:
             memory = Memory(SQLAlchemyRecordStore(session, schema=schema), DiscardEvents())
             persisted = await memory.get_candidate(scope, candidate.id)
-            outbox_rows = (
+            outbox_rows: int = (
                 await session.execute(text(f'SELECT count(*) FROM "{schema}".host_outbox'))
             ).scalar_one()
         assert (persisted.state, persisted.revision, outbox_rows) == (

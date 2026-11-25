@@ -185,7 +185,7 @@ async def open_postgres_host(dsn: str, adapter: str) -> AsyncIterator[PostgresHo
             @asynccontextmanager
             async def transaction(fail_on_append: int | None) -> AsyncIterator[HostTransaction]:
                 async with sessions.begin() as session:
-                    pid = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+                    pid: int = (await session.execute(text("SELECT pg_backend_pid()"))).scalar_one()
 
                     async def execute(statement: str, params: dict[str, object]) -> None:
                         await session.execute(text(statement), params)

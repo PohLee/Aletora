@@ -1,0 +1,2 @@
+# Git hooks run under bash on every platform; keep LF so the shebang works.
+.githooks/* text eol=lf

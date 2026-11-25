@@ -60,7 +60,7 @@ def source_payload(source: SourceRef) -> dict[str, Any]:
     return _source_dict(source)
 
 
-def proposal_payload(proposal: Proposal) -> dict[str, Any]:
+def proposal_payload(proposal: Proposal | Candidate) -> dict[str, Any]:
     return {
         "text": proposal.text,
         "epistemic_kind": proposal.epistemic_kind.value,
@@ -156,29 +156,55 @@ def encode_evidence(evidence: Evidence) -> dict[str, Any]:
     }
 
 
-def decode_evidence(value: dict[str, Any]) -> Evidence:
-    _require_schema_version(value, "evidence")
-    withdrawal_value = value["withdrawal"]
-    withdrawal = (
-        EvidenceWithdrawal(
-            withdrawal_value["actor"],
-            withdrawal_value["reason"],
-            _required_time(withdrawal_value["recorded_at"]),
-        )
-        if withdrawal_value
-        else None
-    )
-    return Evidence(
-        id=value["id"],
-        scope=Scope(**value["scope"]),
-        source=_source(value["source"]),
-        content=value["content"],
-        content_hash=value["content_hash"],
-        captured_at=_required_time(value["captured_at"]),
-        revision=value["revision"],
-        state=EvidenceState(value["state"]),
+def _stored_evidence(**fields: Any) -> Evidence:
+    evidence = object.__new__(Evidence)
+    for name, value in fields.items():
+        object.__setattr__(evidence, name, value)
+    evidence._validate_fields()
+    return evidence
+
+
+def withdrawn_evidence(evidence: Evidence, withdrawal: EvidenceWithdrawal) -> Evidence:
+    """Preserve the stored payload and digest, even when the content is corrupted."""
+    return _stored_evidence(
+        id=evidence.id,
+        scope=evidence.scope,
+        source=evidence.source,
+        content=evidence.content,
+        content_hash=evidence.content_hash,
+        captured_at=evidence.captured_at,
+        revision=evidence.revision + 1,
+        state=EvidenceState.WITHDRAWN,
         withdrawal=withdrawal,
     )
+
+
+def decode_evidence(value: dict[str, Any]) -> Evidence:
+    _require_schema_version(value, "evidence")
+    try:
+        withdrawal_value = value["withdrawal"]
+        withdrawal = (
+            EvidenceWithdrawal(
+                withdrawal_value["actor"],
+                withdrawal_value["reason"],
+                _required_time(withdrawal_value["recorded_at"]),
+            )
+            if withdrawal_value is not None
+            else None
+        )
+        return _stored_evidence(
+            id=value["id"],
+            scope=Scope(**value["scope"]),
+            source=_source(value["source"]),
+            content=value["content"],
+            content_hash=value["content_hash"],
+            captured_at=_required_time(value["captured_at"]),
+            revision=value["revision"],
+            state=EvidenceState(value["state"]),
+            withdrawal=withdrawal,
+        )
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"malformed stored evidence payload: {exc}") from exc
 
 
 def encode_candidate(candidate: Candidate) -> dict[str, Any]:
@@ -222,40 +248,46 @@ def encode_candidate(candidate: Candidate) -> dict[str, Any]:
 
 def decode_candidate(value: dict[str, Any]) -> Candidate:
     _require_schema_version(value, "candidate")
-    application_value = value["application"]
-    application = (
-        ApplicationReceipt(
-            _ref(application_value["ref"]),
-            application_value["actor"],
-            _required_time(application_value["applied_at"]),
+    try:
+        application_value = value["application"]
+        application = (
+            ApplicationReceipt(
+                _ref(application_value["ref"]),
+                application_value["actor"],
+                _required_time(application_value["applied_at"]),
+            )
+            if application_value is not None
+            else None
         )
-        if application_value
-        else None
-    )
-    history = tuple(
-        GovernanceEntry(
-            GovernanceState(entry["state"]),
-            entry["actor"],
-            entry["reason"],
-            _required_time(entry["recorded_at"]),
+        raw_history = value["history"]
+        if not isinstance(raw_history, list):
+            raise ValueError("stored candidate history must be a JSON array")
+        history = tuple(
+            GovernanceEntry(
+                GovernanceState(entry["state"]),
+                entry["actor"],
+                entry["reason"],
+                _required_time(entry["recorded_at"]),
+            )
+            for entry in raw_history
         )
-        for entry in value["history"]
-    )
-    return Candidate(
-        id=value["id"],
-        scope=Scope(**value["scope"]),
-        evidence_id=value["evidence_id"],
-        text=value["text"],
-        epistemic_kind=EpistemicKind(value["epistemic_kind"]),
-        proposer_id=value["proposer_id"],
-        extractor_id=value["extractor_id"],
-        run_id=value["run_id"],
-        proposed_at=_required_time(value["proposed_at"]),
-        valid_from=_parse_time(value["valid_from"]),
-        valid_until=_parse_time(value["valid_until"]),
-        revision=value["revision"],
-        state=GovernanceState(value["state"]),
-        history=history,
-        application=application,
-        replacement_id=value["replacement_id"],
-    )
+        return Candidate(
+            id=value["id"],
+            scope=Scope(**value["scope"]),
+            evidence_id=value["evidence_id"],
+            text=value["text"],
+            epistemic_kind=EpistemicKind(value["epistemic_kind"]),
+            proposer_id=value["proposer_id"],
+            extractor_id=value["extractor_id"],
+            run_id=value["run_id"],
+            proposed_at=_required_time(value["proposed_at"]),
+            valid_from=_parse_time(value["valid_from"]),
+            valid_until=_parse_time(value["valid_until"]),
+            revision=value["revision"],
+            state=GovernanceState(value["state"]),
+            history=history,
+            application=application,
+            replacement_id=value["replacement_id"],
+        )
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"malformed stored candidate payload: {exc}") from exc

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from .._postgres import Executor, PostgresRecordContract
-from ..models import Scope
+from .._postgres import Executor, ManyExecutor, PostgresRecordContract
+from ..models import GovernanceState, Scope, _governance_state_values
 from ..ports import InsertResult, StoredRecord
 
 if TYPE_CHECKING:
@@ -50,11 +50,10 @@ class SQLAlchemyRecordStore:
         self._validate_session(active)
         return active
 
-    async def _execute(
-        self, session: AsyncSession, statement: str, params: dict[str, Any]
-    ) -> Mapping[str, Any] | None:
-        clause = self._text(statement)
+    async def _checked_connection(self, session: AsyncSession, clause: Any) -> Any:
         connection = await session.connection(bind_arguments={"clause": clause})
+        if getattr(getattr(connection, "dialect", None), "name", None) != "postgresql":
+            raise TypeError("SQLAlchemyRecordStore supports PostgreSQL dialects only")
         dbapi_connection = (await connection.get_raw_connection()).dbapi_connection
         # SQLAlchemy's logical transaction and get_isolation_level() do not reveal
         # DBAPI AUTOCOMMIT. Read the actual connection, including caller overrides.
@@ -62,9 +61,38 @@ class SQLAlchemyRecordStore:
             raise RuntimeError(
                 "SQLAlchemy AsyncSession requires a non-AUTOCOMMIT database transaction"
             )
+        return connection
+
+    async def _execute(
+        self, session: AsyncSession, statement: str, params: dict[str, Any]
+    ) -> Mapping[str, Any] | None:
+        clause = self._text(statement)
+        connection = await self._checked_connection(session, clause)
         result = await connection.execute(clause, params)
         row = result.mappings().first()
         return dict(row) if row is not None else None
+
+    async def _execute_many(
+        self, session: AsyncSession, statement: str, params: dict[str, Any]
+    ) -> list[Mapping[str, Any]]:
+        clause = self._text(statement)
+        connection = await self._checked_connection(session, clause)
+        result = await connection.execute(clause, params)
+        return [dict(row) for row in result.mappings().all()]
+
+    def _execute_for(self, session: AsyncSession) -> Executor:
+        async def execute(statement: str, params: dict[str, Any]) -> Mapping[str, Any] | None:
+            return await self._execute(session, statement, params)
+
+        return execute
+
+    def _execute_many_for(self, session: AsyncSession) -> ManyExecutor:
+        async def execute_many(
+            statement: str, params: dict[str, Any]
+        ) -> Sequence[Mapping[str, Any]]:
+            return await self._execute_many(session, statement, params)
+
+        return execute_many
 
     async def get(
         self,
@@ -80,11 +108,81 @@ class SQLAlchemyRecordStore:
             self._execute_for(active), scope, kind, record_id, for_update=for_update
         )
 
-    def _execute_for(self, session: AsyncSession) -> Executor:
-        async def execute(statement: str, params: dict[str, Any]) -> Mapping[str, Any] | None:
-            return await self._execute(session, statement, params)
+    async def get_for_share(
+        self,
+        scope: Scope,
+        kind: str,
+        record_id: str,
+        *,
+        session: AsyncSession | None = None,
+    ) -> StoredRecord | None:
+        active = self._active(session)
+        return await self._contract.get_for_share(self._execute_for(active), scope, kind, record_id)
 
-        return execute
+    async def get_many(
+        self,
+        scope: Scope,
+        kind: str,
+        record_ids: Sequence[str],
+        *,
+        session: AsyncSession | None = None,
+    ) -> dict[str, StoredRecord]:
+        active = self._active(session)
+        return await self._contract.get_many(
+            self._execute_many_for(active), scope, kind, record_ids
+        )
+
+    async def list_records(
+        self,
+        scope: Scope,
+        kind: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        session: AsyncSession | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(session)
+        return await self._contract.list_records(
+            self._execute_many_for(active), scope, kind, after_id=after_id, limit=limit
+        )
+
+    async def list_candidates_by_state(
+        self,
+        scope: Scope,
+        states: Sequence[GovernanceState],
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        session: AsyncSession | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(session)
+        return await self._contract.list_candidates(
+            self._execute_many_for(active),
+            scope,
+            "state",
+            _governance_state_values(states),
+            after_id=after_id,
+            limit=limit,
+        )
+
+    async def list_candidates_by_evidence(
+        self,
+        scope: Scope,
+        evidence_id: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        session: AsyncSession | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(session)
+        return await self._contract.list_candidates(
+            self._execute_many_for(active),
+            scope,
+            "evidence_id",
+            (evidence_id,),
+            after_id=after_id,
+            limit=limit,
+        )
 
     async def insert(
         self,

@@ -8,16 +8,21 @@ from postgres_host import PostgresHost, open_postgres_host
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Skip PostgreSQL integration cases unless a test database is configured."""
-    if os.environ.get("ALETORA_TEST_POSTGRES_DSN"):
-        return
+    """Skip optional integration cases unless their target services are configured."""
+    has_postgres = bool(os.environ.get("ALETORA_TEST_POSTGRES_DSN"))
+    has_qdrant = bool(os.environ.get("ALETORA_TEST_QDRANT_URL"))
 
     skip_postgres = pytest.mark.skip(
         reason="ALETORA_TEST_POSTGRES_DSN is not configured",
     )
+    skip_qdrant = pytest.mark.skip(
+        reason="ALETORA_TEST_QDRANT_URL is not configured",
+    )
     for item in items:
-        if "postgres" in item.keywords:
+        if not has_postgres and "postgres" in item.keywords:
             item.add_marker(skip_postgres)
+        if not has_qdrant and "qdrant_server" in item.keywords:
+            item.add_marker(skip_qdrant)
 
 
 @pytest.fixture(params=["sqlalchemy", "tortoise"])

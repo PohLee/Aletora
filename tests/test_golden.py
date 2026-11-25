@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import aclosing, asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -22,7 +22,7 @@ from aletora import (
 from aletora.adapters.memory import InMemoryDatabase, InMemoryEventSink, InMemoryRecordStore
 from aletora.errors import IdempotencyConflict, InvalidTransition, NotFound, RevisionConflict
 
-NOW = datetime(2026, 2, 1, tzinfo=timezone.utc)
+NOW = datetime(2026, 2, 1, tzinfo=UTC)
 PROFILE = EmbeddingProfile("embed-v2", 4, "prep-v1", "chunk-v3")
 
 
@@ -91,7 +91,7 @@ class _SearchIndex:
     def __init__(self, hits: list[IndexHit]):
         self.hits = hits
         self.calls: list[tuple[Scope, str, int]] = []
-        self.consumed = []
+        self.consumed: list[IndexHit] = []
 
     @asynccontextmanager
     async def scan(self, scope: Scope, query: str, *, budget: int):
@@ -291,6 +291,7 @@ async def test_withdrawn_applied_candidate_keeps_receipt_but_is_not_retrieved():
         )
 
     assert withdrawn.application == applied.application
+    assert applied.application is not None
     index = _SearchIndex([IndexHit(withdrawn.id, withdrawn.revision, 0.9, PROFILE.profile_id)])
     resolver = _Resolver(
         {applied.application.ref: ResolvedRecord(applied.application.ref, "secret")}
@@ -330,6 +331,7 @@ async def test_superseded_candidate_is_excluded_in_favor_of_replacement():
         IndexHit(superseded.id, superseded.revision, 0.99, PROFILE.profile_id),
         IndexHit(replacement.id, replacement.revision, 0.98, PROFILE.profile_id),
     ]
+    assert replacement.application is not None
     replacement_ref = replacement.application.ref
     resolver = _Resolver({replacement_ref: ResolvedRecord(replacement_ref, "replacement content")})
     retrieval = _memory(
@@ -357,14 +359,14 @@ async def test_expired_and_future_validity_windows_are_not_retrieved():
             lifecycle,
             scope,
             "future",
-            valid_from=datetime(2026, 2, 2, tzinfo=timezone.utc),
+            valid_from=datetime(2026, 2, 2, tzinfo=UTC),
         )
         _, current = await _accepted_applied(
             lifecycle,
             scope,
             "current",
-            valid_from=datetime(2026, 2, 1, tzinfo=timezone.utc),
-            valid_until=datetime(2026, 2, 2, tzinfo=timezone.utc),
+            valid_from=datetime(2026, 2, 1, tzinfo=UTC),
+            valid_until=datetime(2026, 2, 2, tzinfo=UTC),
         )
 
     hits = [
@@ -372,6 +374,7 @@ async def test_expired_and_future_validity_windows_are_not_retrieved():
         IndexHit(future.id, future.revision, 0.98, PROFILE.profile_id),
         IndexHit(current.id, current.revision, 0.97, PROFILE.profile_id),
     ]
+    assert current.application is not None
     current_ref = current.application.ref
     resolver = _Resolver({current_ref: ResolvedRecord(current_ref, "currently valid")})
     retrieval = _memory(
@@ -445,6 +448,7 @@ async def test_retrieval_caps_scans_and_never_returns_more_than_limit():
         IndexHit(valid.id, valid.revision, 0.5, PROFILE.profile_id)
     ]
     index = _SearchIndex(hits)
+    assert valid.application is not None
     ref = valid.application.ref
     resolver = _Resolver({ref: ResolvedRecord(ref, "valid formal content")})
     retrieval = _memory(
@@ -474,6 +478,7 @@ async def test_foreign_namespace_index_id_is_not_resolved():
     async with database.transaction():
         _, candidate = await _accepted_applied(lifecycle, owner_scope, "private")
 
+    assert candidate.application is not None
     ref = candidate.application.ref
     index = _SearchIndex([IndexHit(candidate.id, candidate.revision, 1.0, PROFILE.profile_id)])
     resolver = _Resolver({ref: ResolvedRecord(ref, "private formal content")})
@@ -502,6 +507,9 @@ async def test_retrieval_revalidates_stale_profile_and_role_denial_across_pages(
         _, allowed_two = await _accepted_applied(lifecycle, scope, "allowed-two")
         _, denied = await _accepted_applied(lifecycle, scope, "denied")
 
+    assert allowed_one.application is not None
+    assert allowed_two.application is not None
+    assert denied.application is not None
     ref_one = allowed_one.application.ref
     ref_two = allowed_two.application.ref
     denied_ref = denied.application.ref

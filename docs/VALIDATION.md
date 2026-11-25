@@ -33,10 +33,9 @@ needed for that environment failure.
 
 Compatibility: this replaces the unreleased 0.1 `search(..., limit, offset)` / `SearchPage`
 interface. Custom index adapters must implement `scan`; `Memory.retrieve` is unchanged.
-Existing lifecycle/concurrency/AUTOCOMMIT corrections were preserved. No source commit,
-push, release or host-application change was made. The temporary PostgreSQL cluster was
-stopped after validation. Production performance and actual Impulsira/ServexaOS integration
-remain unverified.
+Existing lifecycle/concurrency/AUTOCOMMIT corrections were preserved. The temporary PostgreSQL
+cluster was stopped after validation. Production performance and actual Impulsira/ServexaOS
+integration remain unverified.
 
 ## Post-review corrections (2026-10-13)
 
@@ -51,7 +50,7 @@ A subsequent independent review reproduced two defects beyond the initial 79-tes
 | Full suite with real PostgreSQL 18 | 92 passed, 0 skipped | 92 passed, 0 skipped |
 | Strict mypy, 13 source files | Pass | Pass |
 
-Ruff lint and format checks passed for the complete source/test tree. The sdist and a wheel built from that sdist passed; a clean core-only wheel install verified imports and both packaged SQL templates without optional ORM/Qdrant dependencies. A separate independent review of the complete fix found no remaining correctness or specification findings. The isolated loopback PostgreSQL instance was stopped after verification. No source commit, push, release or host-application change was made during these corrections.
+Ruff lint and format checks passed for the complete source/test tree. The sdist and a wheel built from that sdist passed; a clean core-only wheel install verified imports and both packaged SQL templates without optional ORM/Qdrant dependencies. A separate independent review of the complete fix found no remaining correctness or specification findings. The isolated loopback PostgreSQL instance was stopped after verification.
 
 The historical gate below records the initial implementation; the 92-test gate records the subsequent corrections. The current architecture gate is recorded at the top. Linux CI, production Qdrant and actual host integration remain outside this local verification.
 
