@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
@@ -67,6 +68,16 @@ class GovernanceState(StrEnum):
     REJECTED = "rejected"
     WITHDRAWN = "withdrawn"
     SUPERSEDED = "superseded"
+
+
+def _governance_state_values(states: Sequence[GovernanceState]) -> tuple[str, ...]:
+    if (
+        not isinstance(states, Sequence)
+        or isinstance(states, (str, bytes))
+        or any(not isinstance(state, GovernanceState) for state in states)
+    ):
+        raise ValueError("states must be a sequence of GovernanceState values")
+    return tuple(state.value for state in states)
 
 
 class EvidenceState(StrEnum):
@@ -132,6 +143,11 @@ class Evidence:
     withdrawal: EvidenceWithdrawal | None = None
 
     def __post_init__(self) -> None:
+        self._validate_fields()
+        if hashlib.sha256(self.content.encode("utf-8")).hexdigest() != self.content_hash:
+            raise ValueError("content_hash does not match content")
+
+    def _validate_fields(self) -> None:
         _text("id", self.id)
         if not isinstance(self.scope, Scope) or not isinstance(self.source, SourceRef):
             raise ValueError("scope and source must be typed values")
@@ -142,8 +158,6 @@ class Evidence:
             r"[0-9a-f]{64}", self.content_hash
         ):
             raise ValueError("content_hash must be a lowercase SHA-256 hex digest")
-        if hashlib.sha256(self.content.encode("utf-8")).hexdigest() != self.content_hash:
-            raise ValueError("content_hash does not match content")
         _utc("captured_at", self.captured_at)
         _revision(self.revision)
         _enum("state", self.state, EvidenceState)
@@ -304,6 +318,8 @@ class EmbeddingProfile:
 
 @dataclass(frozen=True, slots=True)
 class Citation:
+    """Evidence provenance with the digest recorded at write time."""
+
     evidence_id: str
     source: SourceRef
     content_hash: str

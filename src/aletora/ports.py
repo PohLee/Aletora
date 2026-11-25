@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-from .models import FormalRef, IndexHit, ResolvedRecord, Scope
+from .models import FormalRef, GovernanceState, IndexHit, ResolvedRecord, Scope
 
 
 class IndexAction(StrEnum):
@@ -124,6 +124,29 @@ class EnumerableRecordStore(RecordStore, Protocol):
     ) -> tuple[StoredRecord, ...]:
         """Return keyset-paginated scoped records ordered by ``record_id``."""
         ...
+
+
+@runtime_checkable
+class CandidateQueryStore(RecordStore, Protocol):
+    """List filtered candidates in ascending record ID within a scope."""
+
+    async def list_candidates_by_state(
+        self,
+        scope: Scope,
+        states: Sequence[GovernanceState],
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredRecord, ...]: ...
+
+    async def list_candidates_by_evidence(
+        self,
+        scope: Scope,
+        evidence_id: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredRecord, ...]: ...
 
 
 @runtime_checkable

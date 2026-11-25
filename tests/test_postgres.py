@@ -15,6 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from aletora import GovernanceState
+
 DSN = os.environ.get("ALETORA_TEST_POSTGRES_DSN")
 postgres = pytest.mark.postgres
 
@@ -488,9 +490,33 @@ async def test_tortoise_shared_rls_enforces_tenant_and_missing_context(
             )
             assert (
                 await store.insert(
-                    scope, "candidate", "one", "key", "fp", {}, transaction=transaction
+                    scope,
+                    "candidate",
+                    "one",
+                    "key",
+                    "fp",
+                    {"state": "proposed", "evidence_id": "parent"},
+                    transaction=transaction,
                 )
             ).created
+            with pytest.raises(ValueError, match="GovernanceState"):
+                await store.list_candidates_by_state(
+                    scope,
+                    ["proposed"],  # type: ignore[list-item]
+                    transaction=transaction,
+                )
+            assert [
+                record.id
+                for record in await store.list_candidates_by_state(
+                    scope, [GovernanceState.PROPOSED], transaction=transaction
+                )
+            ] == ["one"]
+            assert [
+                record.id
+                for record in await store.list_candidates_by_evidence(
+                    scope, "parent", transaction=transaction
+                )
+            ] == ["one"]
             assert (
                 await store.get_for_share(scope, "candidate", "one", transaction=transaction)
                 is not None
@@ -511,6 +537,16 @@ async def test_tortoise_shared_rls_enforces_tenant_and_missing_context(
                 "SELECT set_config($1, $2, true)", ["app.current_tenant_id", "beta"]
             )
             assert await store.get(scope, "candidate", "one", transaction=transaction) is None
+            assert (
+                await store.list_candidates_by_state(
+                    scope, [GovernanceState.PROPOSED], transaction=transaction
+                )
+                == ()
+            )
+            assert (
+                await store.list_candidates_by_evidence(scope, "parent", transaction=transaction)
+                == ()
+            )
             with pytest.raises(NotFound):
                 await store.update(scope, "candidate", "one", 1, {"x": 2}, transaction=transaction)
         with pytest.raises(OperationalError):
@@ -663,16 +699,45 @@ async def test_shared_rls_denies_missing_and_cross_tenant_access(
             await assume_role(session, "alpha")
             assert (
                 await store.insert(
-                    Scope("alpha", "ns"), "candidate", "one", "k", "f", {}, session=session
+                    Scope("alpha", "ns"),
+                    "candidate",
+                    "one",
+                    "k",
+                    "f",
+                    {"state": "proposed", "evidence_id": "parent"},
+                    session=session,
                 )
             ).created
+            with pytest.raises(ValueError, match="GovernanceState"):
+                await store.list_candidates_by_state(
+                    Scope("alpha", "ns"),
+                    ["proposed"],  # type: ignore[list-item]
+                    session=session,
+                )
+            assert [
+                record.id
+                for record in await store.list_candidates_by_state(
+                    Scope("alpha", "ns"), [GovernanceState.PROPOSED], session=session
+                )
+            ] == ["one"]
+            assert [
+                record.id
+                for record in await store.list_candidates_by_evidence(
+                    Scope("alpha", "ns"), "parent", session=session
+                )
+            ] == ["one"]
             assert (
                 await store.get_for_share(Scope("alpha", "ns"), "candidate", "one", session=session)
                 is not None
             )
             assert (
                 await store.update(
-                    Scope("alpha", "ns"), "candidate", "one", 1, {"ok": True}, session=session
+                    Scope("alpha", "ns"),
+                    "candidate",
+                    "one",
+                    1,
+                    {"state": "proposed", "evidence_id": "parent", "ok": True},
+                    session=session,
                 )
             ).revision == 2
         async with sessions.begin() as session:
@@ -691,6 +756,18 @@ async def test_shared_rls_denies_missing_and_cross_tenant_access(
             )
             assert (
                 await store.list_records(Scope("alpha", "ns"), "candidate", session=session) == ()
+            )
+            assert (
+                await store.list_candidates_by_state(
+                    Scope("alpha", "ns"), [GovernanceState.PROPOSED], session=session
+                )
+                == ()
+            )
+            assert (
+                await store.list_candidates_by_evidence(
+                    Scope("alpha", "ns"), "parent", session=session
+                )
+                == ()
             )
             with pytest.raises(NotFound):
                 await store.update(Scope("alpha", "ns"), "candidate", "one", 2, {}, session=session)
@@ -731,6 +808,16 @@ async def test_migration_rejects_whitespace_only_keys(
     connection = await asyncpg.connect(_asyncpg_dsn(dsn))
     try:
         await connection.execute(render_migration(migration, schema=schema))
+        indexes = await connection.fetch(
+            "SELECT indexname, indexdef FROM pg_indexes "
+            "WHERE schemaname=$1 AND tablename='aletora_records'",
+            schema,
+        )
+        definitions = {row["indexname"]: row["indexdef"] for row in indexes}
+        for field in ("state", "evidence_id"):
+            definition = definitions[f"aletora_candidates_{field}_idx"]
+            assert f"payload ->> '{field}'" in definition
+            assert "WHERE (kind = 'candidate'::text)" in definition
         for index in range(5):
             for blank in ("\t", "\n", "\u00a0", "\u3000"):
                 keys = ["tenant", "namespace", "candidate", "id", "key"]
@@ -747,3 +834,23 @@ async def test_migration_rejects_whitespace_only_keys(
                         )
     finally:
         await connection.close()
+
+
+@pytest.mark.parametrize("missing", ["_finalized", "is_in_transaction"])
+def test_tortoise_rejects_missing_transaction_state_probe(missing: str) -> None:
+    pytest.importorskip("tortoise")
+    from tortoise.backends.base.client import Capabilities, TransactionalDBClient
+
+    from aletora.adapters.tortoise import TortoiseRecordStore
+
+    wrapper = MagicMock(spec=TransactionalDBClient)
+    wrapper.capabilities = Capabilities(dialect="postgres")
+    wrapper.transaction = object()
+    wrapper._connection = SimpleNamespace()
+    if missing == "_finalized":
+        del wrapper._finalized
+    else:
+        wrapper._finalized = False
+
+    with pytest.raises(RuntimeError, match=missing):
+        TortoiseRecordStore(wrapper)

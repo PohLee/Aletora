@@ -156,6 +156,29 @@ def encode_evidence(evidence: Evidence) -> dict[str, Any]:
     }
 
 
+def _stored_evidence(**fields: Any) -> Evidence:
+    evidence = object.__new__(Evidence)
+    for name, value in fields.items():
+        object.__setattr__(evidence, name, value)
+    evidence._validate_fields()
+    return evidence
+
+
+def withdrawn_evidence(evidence: Evidence, withdrawal: EvidenceWithdrawal) -> Evidence:
+    """Preserve the stored payload and digest, even when the content is corrupted."""
+    return _stored_evidence(
+        id=evidence.id,
+        scope=evidence.scope,
+        source=evidence.source,
+        content=evidence.content,
+        content_hash=evidence.content_hash,
+        captured_at=evidence.captured_at,
+        revision=evidence.revision + 1,
+        state=EvidenceState.WITHDRAWN,
+        withdrawal=withdrawal,
+    )
+
+
 def decode_evidence(value: dict[str, Any]) -> Evidence:
     _require_schema_version(value, "evidence")
     try:
@@ -169,7 +192,7 @@ def decode_evidence(value: dict[str, Any]) -> Evidence:
             if withdrawal_value is not None
             else None
         )
-        return Evidence(
+        return _stored_evidence(
             id=value["id"],
             scope=Scope(**value["scope"]),
             source=_source(value["source"]),

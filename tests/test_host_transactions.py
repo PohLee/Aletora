@@ -103,3 +103,59 @@ async def test_failed_promotion_rolls_back_and_can_be_retried(
     async with postgres_host.transaction() as transaction:
         assert await transaction.memory.get_evidence(SCOPE, evidence.id) == evidence
         assert await transaction.memory.get_candidate(SCOPE, applied.id) == applied
+
+
+async def test_filtered_candidate_queries(postgres_host: PostgresHost) -> None:
+    async with postgres_host.transaction() as transaction:
+        memory = transaction.memory
+        evidence, accepted = await accept_candidate(transaction)
+        proposal = Proposal(
+            "Another claim",
+            EpistemicKind.ASSERTED,
+            "author",
+            "extractor",
+            "run",
+            STAMP,
+        )
+        proposed = await memory.propose(SCOPE, evidence.id, proposal, idempotency_key="other")
+        other_scope = Scope(SCOPE.tenant_id, "other")
+        other_evidence = await memory.record_evidence(
+            other_scope,
+            evidence.source,
+            evidence.content,
+            idempotency_key="other",
+        )
+        await memory.propose(other_scope, other_evidence.id, proposal, idempotency_key="other")
+        assert await memory.list_candidates_by_state(SCOPE, [GovernanceState.PROPOSED]) == (
+            proposed,
+        )
+        assert await memory.list_candidates_by_state(SCOPE, []) == ()
+        expected = tuple(sorted((accepted, proposed), key=lambda candidate: candidate.id))
+        states = [GovernanceState.ACCEPTED, GovernanceState.PROPOSED]
+        assert await memory.list_candidates_by_state(SCOPE, states, limit=1) == expected[:1]
+        assert (
+            await memory.list_candidates_by_state(
+                SCOPE,
+                states,
+                after_id=expected[0].id,
+            )
+            == expected[1:]
+        )
+        assert (
+            await memory.list_candidates_by_evidence(
+                SCOPE,
+                evidence.id,
+                limit=1,
+            )
+            == expected[:1]
+        )
+        assert (
+            await memory.list_candidates_by_evidence(
+                SCOPE,
+                evidence.id,
+                after_id=expected[0].id,
+            )
+            == expected[1:]
+        )
+        assert await memory.list_candidates_by_evidence(other_scope, evidence.id) == ()
+        assert await memory.list_candidates_by_evidence(SCOPE, other_evidence.id) == ()

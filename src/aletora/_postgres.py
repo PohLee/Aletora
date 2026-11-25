@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from .errors import IdempotencyConflict, NotFound, RevisionConflict
 from .models import Scope
@@ -181,6 +181,36 @@ class PostgresRecordContract:
                 "AND kind=:kind ORDER BY record_id ASC LIMIT :limit"
             )
         rows = await execute_many(statement, params)
+        return tuple(decode_record(row) for row in rows)
+
+    async def list_candidates(
+        self,
+        execute_many: ManyExecutor,
+        scope: Scope,
+        field: Literal["state", "evidence_id"],
+        values: Sequence[str],
+        *,
+        after_id: str | None,
+        limit: int,
+    ) -> tuple[StoredRecord, ...]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer from 1 to 1000")
+        expression = {
+            "state": "payload->>'state'",
+            "evidence_id": "payload->>'evidence_id'",
+        }[field]
+        params = _kind_params(scope, "candidate")
+        del params["kind"]
+        params.update(values=list(values), limit=limit)
+        statement = (
+            f"SELECT record_id, revision, payload FROM {self.table} "
+            "WHERE tenant_id=:tenant_id AND namespace=:namespace AND kind='candidate' "
+            f"AND ({expression}) = ANY(CAST(:values AS text[])) "
+        )
+        if after_id is not None:
+            params["after_id"] = after_id
+            statement += "AND record_id > :after_id "
+        rows = await execute_many(statement + "ORDER BY record_id ASC LIMIT :limit", params)
         return tuple(decode_record(row) for row in rows)
 
     async def insert(

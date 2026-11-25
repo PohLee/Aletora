@@ -27,9 +27,22 @@ Tests cross the same interface as callers. Use vertical red-green slices, not te
 
 ## Public module
 
-`Memory` exposes `record_evidence`, `get_evidence`, `propose`, `propose_many`, `get_candidate`, `list_candidates`, `review`, `record_application`, `withdraw`, `supersede`, `withdraw_evidence`, `retrieve`, `retrieve_with_stats`. This is the whole lifecycle module, not ten forwarding modules. Scope is explicit on each operation. Reads return immutable typed snapshots; mutation results expose revision.
+`Memory` exposes `record_evidence`, `get_evidence`, `verify_evidence`, `propose`, `propose_many`, `get_candidate`, `list_candidates`, `list_candidates_by_state`, `list_candidates_by_evidence`, `review`, `record_application`, `withdraw`, `supersede`, `withdraw_evidence`, `retrieve`, `retrieve_with_stats`. This is the whole lifecycle module, not ten forwarding modules. Scope is explicit on each operation. Reads return immutable typed snapshots; mutation results expose revision.
 
 `propose` accepts one host-produced `Proposal` and one evidence ID. `propose_many(scope, evidence_id, items)` requires a sequence of `(Proposal, idempotency_key)` tuples and returns snapshots in input order. It rejects invalid items and same-key, different-content pairs before store access, then batch-reads existing candidates before writing. Matching fingerprints reuse stored snapshots. A conflicting fingerprint raises `IdempotencyConflict` before any insert. New candidates share one parent-evidence lock and are inserted in ascending record-ID order. The host must roll back the entire transaction on any exception, including conflicts detected by the store during concurrent inserts. Review records reviewer/reason/time, and application records a `FormalRef`. Withdrawal and supersession record actor/reason/time. Evidence withdrawal rejects later proposals and blocks referencing hits. `list_candidates(scope, *, after_id=None, limit=100)` paginates scoped candidates in ascending `record_id` order when the store implements `EnumerableRecordStore`.
+
+Direct `Evidence` construction and recording validate the SHA-256 against the
+content. The storage decoder validates digest syntax and the other snapshot fields
+without recomputing the digest. Retrieval also skips recomputation.
+`Citation.content_hash` is the digest recorded at write time. Governance mutations
+verify any evidence they load for a new transition and raise `EvidenceIntegrityError`
+on mismatch. Evidence withdrawal skips this digest check.
+`verify_evidence(scope, evidence_id)` recomputes the digest and returns whether it matches. Missing evidence raises `NotFound`
+and malformed stored payloads raise `ValueError`. This check detects corruption.
+A party with write access to storage can change both the content and digest.
+The optional positive integer `max_evidence_bytes` applies to UTF-8 content on
+`record_evidence`, including retries. Oversized input raises `EvidenceTooLarge`
+before store access. The default is unlimited.
 
 Changes to existing candidates require `expected_revision`. `review`, `record_application`, and `supersede` acquire candidate row locks (`for_update=True`) before evidence locks (`get_for_share` or `for_update=True` fallback). Supersession requires a distinct, accepted replacement in the same Scope and locks both candidates in sorted record-ID order before validating states and replacement evidence. Invalid transitions and invalid inputs raise typed errors.
 
@@ -89,9 +102,17 @@ Optional extension protocols in `ports.py` and their fallbacks are:
 - `ShareLockableRecordStore.get_for_share(scope, kind, record_id)` (`SELECT ... FOR SHARE`)
 - `BatchRecordStore.get_many(scope, kind, record_ids)`
 - `EnumerableRecordStore.list_records(scope, kind, *, after_id=None, limit=100)`
+- `CandidateQueryStore.list_candidates_by_state(scope, states, *, after_id=None, limit=100)`
+- `CandidateQueryStore.list_candidates_by_evidence(scope, evidence_id, *, after_id=None, limit=100)`
 - `BatchRecordResolver.resolve_many(scope, refs)`
 
 Without the share-lock extension, lifecycle methods lock evidence with `RecordStore.get(..., for_update=True)`. Without a batch extension, retrieval calls the equivalent single-record method with per-call memoization. `list_candidates` requires the enumeration extension and raises `CapabilityUnavailable` when it is absent.
+
+Both filtered queries require `CandidateQueryStore` and raise
+`CapabilityUnavailable` when absent. Like `list_candidates`, they require
+an integer limit from 1 to 1000 and order candidates by ascending record ID.
+The cursor is exclusive. Pass a sequence of governance states for an any-state
+match. An empty sequence matches no candidates.
 
 `SearchIndex.scan` is a single-use, sequential discovery traversal. `budget` is a positive
 integer (excluding booleans) counting raw index points, including malformed, stale, duplicate
@@ -137,6 +158,12 @@ or stale revision takes precedence over a duplicate of a returned candidate. Rep
 an expired candidate count separately under `validity_window_skipped`. The raw-point `budget`
 also covers malformed points discarded by the index, including Qdrant candidate IDs containing
 NUL bytes. Those points do not appear in `hits_examined`.
+
+The optional synchronous `on_retrieval(stats, elapsed_seconds)` observer runs
+once after either public retrieval method succeeds, including empty results.
+The elapsed time uses `time.perf_counter` and excludes observer execution.
+Ordinary observer exceptions produce a warning and preserve the result.
+Observers should only emit telemetry and must avoid using the host transaction.
 
 Qdrant adapter receives caller-owned AsyncQdrantClient, explicit collection and versioned EmbeddingProfile (model, dimension, preprocessing/chunking versions). It uses an injected async embed callable for search; no supplier SDK. `ensure_collection()` creates payload indexes for `tenant_id` (`is_tenant=True`), `namespace`, `profile_id`, `candidate_id`, `evidence_id`, and `revision`. Worker-facing upsert/delete validate scope, dimensions, profile, candidate revision, and required `evidence_id` (with optional `prune_prior_revisions`), and `reconcile_event` implements authoritative worker reconciliation. Stable point ID includes Scope, candidate ID, profile and revision: retrying the same revision is idempotent, while a delayed older upsert cannot overwrite a newer revision. Candidate deletion requires a positive revision and removes only matching projections at or below it, never a newer revision. Exact payload tenant/namespace/profile filtering and current revision re-read during retrieval remain mandatory. Older revisions may persist and consume the finite scan budget until worker cleanup/rebuild; no strict recall-quality or physical-erasure guarantee is made. No automatic collection or network access on import. Worker retry/rebuild/delete, delayed old upsert/delete and profile mismatch tests use real local-mode Qdrant and server-mode CI Qdrant.
 

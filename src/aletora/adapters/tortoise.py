@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .._postgres import Executor, ManyExecutor, PostgresRecordContract
-from ..models import Scope
+from ..models import GovernanceState, Scope, _governance_state_values
 from ..ports import InsertResult, StoredRecord
 
 # Negative lookbehind avoids matching PostgreSQL ``::type`` casts as named params.
@@ -50,11 +50,16 @@ class TortoiseRecordStore:
         # wrapper tracks wrapper finalization and the underlying asyncpg
         # transaction and connection. Check these before every statement so a
         # released wrapper can never fall back into Tortoise's pool/autocommit path.
-        if getattr(transaction, "_finalized", True) is not False:
+        finalized = getattr(transaction, "_finalized", None)
+        if finalized is None:
+            raise RuntimeError("Tortoise transaction wrapper is missing _finalized")
+        if finalized is not False:
             raise RuntimeError("an active PostgreSQL Tortoise transaction is required")
         underlying_transaction = getattr(transaction, "transaction", None)
         connection = getattr(transaction, "_connection", None)
         is_in_transaction = getattr(connection, "is_in_transaction", None)
+        if connection is not None and not callable(is_in_transaction):
+            raise RuntimeError("Tortoise connection is missing callable is_in_transaction")
         if underlying_transaction is None or not callable(is_in_transaction):
             raise RuntimeError("an active PostgreSQL Tortoise transaction is required")
         try:
@@ -159,6 +164,44 @@ class TortoiseRecordStore:
         active = self._active(transaction)
         return await self._contract.list_records(
             self._execute_many_for(active), scope, kind, after_id=after_id, limit=limit
+        )
+
+    async def list_candidates_by_state(
+        self,
+        scope: Scope,
+        states: Sequence[GovernanceState],
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        transaction: Any | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(transaction)
+        return await self._contract.list_candidates(
+            self._execute_many_for(active),
+            scope,
+            "state",
+            _governance_state_values(states),
+            after_id=after_id,
+            limit=limit,
+        )
+
+    async def list_candidates_by_evidence(
+        self,
+        scope: Scope,
+        evidence_id: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        transaction: Any | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(transaction)
+        return await self._contract.list_candidates(
+            self._execute_many_for(active),
+            scope,
+            "evidence_id",
+            (evidence_id,),
+            after_id=after_id,
+            limit=limit,
         )
 
     async def insert(

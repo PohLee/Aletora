@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from .._postgres import Executor, ManyExecutor, PostgresRecordContract
-from ..models import Scope
+from ..models import GovernanceState, Scope, _governance_state_values
 from ..ports import InsertResult, StoredRecord
 
 if TYPE_CHECKING:
@@ -144,6 +144,44 @@ class SQLAlchemyRecordStore:
         active = self._active(session)
         return await self._contract.list_records(
             self._execute_many_for(active), scope, kind, after_id=after_id, limit=limit
+        )
+
+    async def list_candidates_by_state(
+        self,
+        scope: Scope,
+        states: Sequence[GovernanceState],
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        session: AsyncSession | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(session)
+        return await self._contract.list_candidates(
+            self._execute_many_for(active),
+            scope,
+            "state",
+            _governance_state_values(states),
+            after_id=after_id,
+            limit=limit,
+        )
+
+    async def list_candidates_by_evidence(
+        self,
+        scope: Scope,
+        evidence_id: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        session: AsyncSession | None = None,
+    ) -> tuple[StoredRecord, ...]:
+        active = self._active(session)
+        return await self._contract.list_candidates(
+            self._execute_many_for(active),
+            scope,
+            "evidence_id",
+            (evidence_id,),
+            after_id=after_id,
+            limit=limit,
         )
 
     async def insert(

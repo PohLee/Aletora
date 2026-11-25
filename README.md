@@ -332,6 +332,18 @@ Call answer_context inside the request's host transaction/session. Results conta
 
 Use `retrieve_with_stats(scope, query, limit=...)` to return the authorized hits and `RetrievalStats` counters together. A scan can return fewer hits than requested when it exhausts its budget. Treat evidence text and citation fields (`SourceRef.uri`, `locator`, and `source_id`) as untrusted input. Escape displayed values and allowlist link schemes such as HTTPS before rendering citations in a host UI.
 
+## Evidence limits and integrity
+
+Set `Memory(..., max_evidence_bytes=...)` to reject oversized evidence with
+`EvidenceTooLarge` before any store access. The limit counts UTF-8 bytes and defaults
+to unlimited. Ordinary reads validate the stored digest format without recomputing it.
+Retrieval and read-only queries skip SHA-256 recomputation. Each `Citation.content_hash`
+is the digest recorded when the evidence was written. Use
+`await memory.verify_evidence(scope, evidence_id)` to spot-check stored content.
+Governance mutations that load evidence verify the digest and raise `EvidenceIntegrityError`
+on a mismatch. Evidence withdrawal remains available for a mismatched digest.
+A writer who can modify the stored content can also change its digest.
+
 ## Lifecycle operations
 
 - record_evidence(scope, source, content, idempotency_key=...) records an immutable source snapshot and content hash.
@@ -343,6 +355,17 @@ Use `retrieve_with_stats(scope, query, limit=...)` to return the authorized hits
 - withdraw_evidence(..., expected_revision=...) blocks retrieval of candidates supported by that Evidence while retaining its audit history.
 
 See the [API examples and guarantees](docs/V1-SPEC.md), [PostgreSQL integration](docs/POSTGRES.md), and [Qdrant integration](docs/QDRANT.md) for full method contracts.
+
+Use `list_candidates_by_state(scope, [GovernanceState.PROPOSED])` for a review queue
+or `list_candidates_by_evidence(scope, evidence_id)` to inspect lineage. Both use
+`after_id` and `limit` pagination and require `CandidateQueryStore`.
+
+Pass a synchronous `on_retrieval(stats, elapsed_seconds)` callback to observe completed
+retrievals. Failed retrievals skip it. Callback exceptions are logged at warning level
+and the retrieval result is still returned.
+
+See the [host outbox example](examples/README.md) for a PostgreSQL batch that reconciles
+Qdrant projections.
 
 ## Local development and verification
 

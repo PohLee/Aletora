@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -10,6 +12,8 @@ from typing import Any
 from . import _codec
 from .errors import (
     CapabilityUnavailable,
+    EvidenceIntegrityError,
+    EvidenceTooLarge,
     IdempotencyConflict,
     InvalidTransition,
     NotFound,
@@ -34,10 +38,12 @@ from .models import (
     RetrievalStats,
     Scope,
     SourceRef,
+    _governance_state_values,
 )
 from .ports import (
     BatchRecordResolver,
     BatchRecordStore,
+    CandidateQueryStore,
     EnumerableRecordStore,
     EventSink,
     IndexAction,
@@ -46,7 +52,10 @@ from .ports import (
     RecordStore,
     SearchIndex,
     ShareLockableRecordStore,
+    StoredRecord,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 _EVIDENCE = "evidence"
 _CANDIDATE = "candidate"
@@ -55,7 +64,12 @@ _MAX_LIST_LIMIT = 1000
 
 
 class Memory:
-    """Lifecycle operations over host-owned persistence and outbox transactions."""
+    """Lifecycle operations over host-owned persistence and outbox transactions.
+
+    Governance mutations verify the digest of evidence they load for a new
+    transition and raise ``EvidenceIntegrityError`` on a mismatch. Evidence
+    withdrawal remains available for a mismatched digest.
+    """
 
     def __init__(
         self,
@@ -67,11 +81,23 @@ class Memory:
         profile: EmbeddingProfile | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         scan_budget: int = 200,
+        max_evidence_bytes: int | None = None,
+        on_retrieval: Callable[[RetrievalStats, float], None] | None = None,
     ) -> None:
         if isinstance(scan_budget, bool) or not isinstance(scan_budget, int) or scan_budget < 1:
             raise ValueError("scan_budget must be a positive integer")
         if not callable(clock):
             raise ValueError("clock must be callable")
+        if max_evidence_bytes is not None and (
+            isinstance(max_evidence_bytes, bool)
+            or not isinstance(max_evidence_bytes, int)
+            or max_evidence_bytes < 1
+        ):
+            raise ValueError("max_evidence_bytes must be a positive integer")
+        if on_retrieval is not None and not callable(on_retrieval):
+            raise ValueError("on_retrieval must be callable")
+        self._max_evidence_bytes = max_evidence_bytes
+        self._on_retrieval = on_retrieval
         self._store = store
         self._event_sink = event_sink
         self._index = index
@@ -107,6 +133,9 @@ class Memory:
             raise ValueError("content must be a string")
         if "\x00" in content:
             raise ValueError("content must not contain NUL bytes")
+        maximum = self._max_evidence_bytes
+        if maximum is not None and len(content.encode("utf-8")) > maximum:
+            raise EvidenceTooLarge(f"evidence exceeds the {maximum}-byte UTF-8 limit")
         captured = captured_at if captured_at is not None else self._now()
         evidence_id = _codec.stable_id(scope, _EVIDENCE, idempotency_key)
         content_hash = _codec.hash_content(content)
@@ -128,7 +157,7 @@ class Memory:
         )
 
     async def get_evidence(self, scope: Scope, evidence_id: str) -> Evidence:
-        """Fetch an immutable evidence snapshot within ``scope``.
+        """Fetch an immutable evidence snapshot within ``scope`` without rehashing content.
 
         Raises:
             ValueError: On invalid scope/key or corrupt stored payload.
@@ -136,6 +165,11 @@ class Memory:
         """
         self._require_scope(scope)
         return await self._load_evidence(scope, evidence_id)
+
+    async def verify_evidence(self, scope: Scope, evidence_id: str) -> bool:
+        """Check whether stored evidence content matches its stored SHA-256 digest."""
+        evidence = await self.get_evidence(scope, evidence_id)
+        return _codec.hash_content(evidence.content) == evidence.content_hash
 
     async def propose(
         self,
@@ -317,6 +351,15 @@ class Memory:
             CapabilityUnavailable: When the configured store does not implement
                 ``EnumerableRecordStore``.
         """
+        self._validate_candidate_page(scope, after_id, limit)
+        if not isinstance(self._store, EnumerableRecordStore):
+            raise CapabilityUnavailable(
+                "listing candidates requires a store implementing EnumerableRecordStore"
+            )
+        records = await self._store.list_records(scope, _CANDIDATE, after_id=after_id, limit=limit)
+        return self._decode_candidate_page(scope, records)
+
+    def _validate_candidate_page(self, scope: Scope, after_id: str | None, limit: int) -> None:
         self._require_scope(scope)
         if after_id is not None:
             self._require_key(after_id)
@@ -326,15 +369,56 @@ class Memory:
             or not 1 <= limit <= _MAX_LIST_LIMIT
         ):
             raise ValueError(f"limit must be an integer from 1 to {_MAX_LIST_LIMIT}")
-        if not isinstance(self._store, EnumerableRecordStore):
+
+    def _candidate_query_store(
+        self, scope: Scope, after_id: str | None, limit: int
+    ) -> CandidateQueryStore:
+        self._validate_candidate_page(scope, after_id, limit)
+        if not isinstance(self._store, CandidateQueryStore):
             raise CapabilityUnavailable(
-                "listing candidates requires a store implementing EnumerableRecordStore"
+                "filtered candidate listing requires a store implementing CandidateQueryStore"
             )
-        records = await self._store.list_records(scope, _CANDIDATE, after_id=after_id, limit=limit)
+        return self._store
+
+    def _decode_candidate_page(
+        self, scope: Scope, records: Sequence[StoredRecord]
+    ) -> tuple[Candidate, ...]:
         return tuple(
             self._decode_candidate(scope, record.id, record.revision, record.payload)
             for record in records
         )
+
+    async def list_candidates_by_state(
+        self,
+        scope: Scope,
+        states: Sequence[GovernanceState],
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[Candidate, ...]:
+        """List candidates matching any of the supplied governance states."""
+        _governance_state_values(states)
+        store = self._candidate_query_store(scope, after_id, limit)
+        records = await store.list_candidates_by_state(
+            scope, states, after_id=after_id, limit=limit
+        )
+        return self._decode_candidate_page(scope, records)
+
+    async def list_candidates_by_evidence(
+        self,
+        scope: Scope,
+        evidence_id: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[Candidate, ...]:
+        """List candidates referencing the given evidence ID."""
+        self._require_key(evidence_id)
+        store = self._candidate_query_store(scope, after_id, limit)
+        records = await store.list_candidates_by_evidence(
+            scope, evidence_id, after_id=after_id, limit=limit
+        )
+        return self._decode_candidate_page(scope, records)
 
     async def review(
         self,
@@ -525,6 +609,8 @@ class Memory:
     ) -> Evidence:
         """Withdraw evidence so future proposals/applications fail and retrieval drops hits.
 
+        Withdrawal is allowed when stored content does not match its digest.
+
         Raises:
             ValueError: On invalid arguments or NUL bytes.
             NotFound: When ``evidence_id`` does not exist in ``scope``.
@@ -540,12 +626,7 @@ class Memory:
         if evidence.state is EvidenceState.WITHDRAWN:
             raise InvalidTransition("evidence is already withdrawn")
         withdrawal = EvidenceWithdrawal(actor, reason, self._now())
-        updated = replace(
-            evidence,
-            revision=evidence.revision + 1,
-            state=EvidenceState.WITHDRAWN,
-            withdrawal=withdrawal,
-        )
+        updated = _codec.withdrawn_evidence(evidence, withdrawal)
         stored = await self._store.update(
             scope, _EVIDENCE, evidence_id, expected_revision, _codec.encode_evidence(updated)
         )
@@ -558,6 +639,9 @@ class Memory:
     async def retrieve(self, scope: Scope, query: str, *, limit: int) -> tuple[RetrievalHit, ...]:
         """Retrieve authorized, currently valid formal records matching ``query``.
 
+        Citations carry the digest recorded at write time. Retrieval skips rehashing.
+        Use ``verify_evidence`` to check content integrity.
+
         Raises:
             ValueError: On invalid scope, query, limit, or corrupt stored records.
             CapabilityUnavailable: When index, resolver, or profile is not configured.
@@ -566,6 +650,9 @@ class Memory:
 
     async def retrieve_with_stats(self, scope: Scope, query: str, *, limit: int) -> RetrievalResult:
         """Retrieve authorized formal records paired with bounded-scan diagnostics.
+
+        Citations carry the digest recorded at write time. Retrieval skips rehashing.
+        Use ``verify_evidence`` to check content integrity.
 
         Uses per-call memoization across duplicate/stale hits and shared evidence, and
         automatically uses ``BatchRecordStore.get_many`` / ``BatchRecordResolver.resolve_many``
@@ -578,6 +665,7 @@ class Memory:
             CapabilityUnavailable: When index, resolver, or profile is not configured.
             TypeError: When ``SearchIndex.scan`` yields a non-``IndexHit`` value.
         """
+        started = time.perf_counter() if self._on_retrieval is not None else 0.0
         self._require_scope(scope)
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
@@ -682,7 +770,13 @@ class Memory:
             budget=self._scan_budget,
             limit_reached=len(hits) == limit,
         )
-        return RetrievalResult(tuple(hits), stats)
+        result = RetrievalResult(tuple(hits), stats)
+        if self._on_retrieval is not None:
+            try:
+                self._on_retrieval(stats, time.perf_counter() - started)
+            except Exception:
+                _LOGGER.warning("Retrieval observer failed", exc_info=True)
+        return result
 
     async def _process_retrieval_batch(
         self,
@@ -880,7 +974,13 @@ class Memory:
             stored = await self._store.get(scope, _EVIDENCE, evidence_id, for_update=for_update)
         if stored is None:
             raise NotFound(f"evidence {evidence_id!r} was not found")
-        return self._decode_evidence(scope, stored.id, stored.revision, stored.payload)
+        evidence = self._decode_evidence(scope, stored.id, stored.revision, stored.payload)
+        # Only governance paths using lock=True require a matching digest.
+        if lock and _codec.hash_content(evidence.content) != evidence.content_hash:
+            raise EvidenceIntegrityError(
+                f"evidence {evidence_id!r} content_hash does not match content"
+            )
+        return evidence
 
     async def _load_candidate(
         self, scope: Scope, candidate_id: str, *, for_update: bool = False

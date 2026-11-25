@@ -20,3 +20,11 @@ ALTER TABLE {{table}} FORCE ROW LEVEL SECURITY;
 CREATE POLICY aletora_records_tenant_scope ON {{table}}
     USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), ''))
     WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), ''));
+
+CREATE INDEX aletora_candidates_state_idx ON {{table}}
+    (tenant_id, namespace, (payload->>'state'), record_id)
+    WHERE kind = 'candidate';
+
+CREATE INDEX aletora_candidates_evidence_id_idx ON {{table}}
+    (tenant_id, namespace, (payload->>'evidence_id'), record_id)
+    WHERE kind = 'candidate';

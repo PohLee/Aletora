@@ -1,5 +1,6 @@
 import hashlib
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from aletora import (
 from aletora.adapters.memory import InMemoryDatabase, InMemoryEventSink, InMemoryRecordStore
 from aletora.errors import (
     CapabilityUnavailable,
+    EvidenceIntegrityError,
     IdempotencyConflict,
     InvalidTransition,
     NotFound,
@@ -712,3 +714,178 @@ async def test_memory_rejects_non_list_candidate_history() -> None:
     with pytest.raises(ValueError, match="history"):
         async with database.transaction():
             await corrupted.get_candidate(scope, candidate_id)
+
+
+async def test_read_skips_hash_and_verify_detects_corruption(monkeypatch) -> None:
+    database = InMemoryDatabase()
+    store = InMemoryRecordStore(database)
+    memory = Memory(store, InMemoryEventSink(database))
+    scope = Scope("tenant", "notes")
+
+    def unexpected_hash(*args):
+        pytest.fail("ordinary evidence reads must not hash content")
+
+    async with database.transaction():
+        evidence_id, _ = await _seed(memory, scope)
+        with monkeypatch.context() as patch:
+            patch.setattr(hashlib, "sha256", unexpected_hash)
+            evidence = await memory.get_evidence(scope, evidence_id)
+        assert await memory.verify_evidence(scope, evidence_id)
+        record = await store.get(scope, "evidence", evidence_id)
+        assert record is not None
+        await store.update(
+            scope,
+            "evidence",
+            evidence_id,
+            evidence.revision,
+            {**record.payload, "revision": evidence.revision + 1, "content": "Corrupted"},
+        )
+        assert not await memory.verify_evidence(scope, evidence_id)
+
+
+@pytest.mark.parametrize("maximum", [0, -1, True, 1.5, "3"])
+def test_evidence_byte_limit_requires_positive_integer(maximum) -> None:
+    database = InMemoryDatabase()
+    with pytest.raises(ValueError, match="max_evidence_bytes"):
+        Memory(
+            InMemoryRecordStore(database), InMemoryEventSink(database), max_evidence_bytes=maximum
+        )
+
+
+async def test_evidence_byte_limit_counts_utf8_before_any_store_access() -> None:
+    from aletora import EvidenceTooLarge
+
+    database = InMemoryDatabase()
+    store = MinimalRecordStore(InMemoryRecordStore(database))
+    memory = Memory(store, InMemoryEventSink(database), max_evidence_bytes=3)
+    scope = Scope("tenant", "notes")
+    source = SourceRef(SourceKind.DOCUMENT, "doc", "1", "page:1")
+    with pytest.raises(EvidenceTooLarge):
+        await memory.record_evidence(scope, source, "\u00e9ab", idempotency_key="too-large")
+    assert not store.get_calls and not store.insert_calls
+    async with database.transaction():
+        evidence = await memory.record_evidence(scope, source, "\u00e9a", idempotency_key="fits")
+        assert evidence.content == "\u00e9a"
+
+
+async def test_filtered_candidate_pages_and_optional_capability() -> None:
+    database = InMemoryDatabase()
+    store = InMemoryRecordStore(database)
+    sink = InMemoryEventSink(database)
+    memory = Memory(store, sink)
+    scope = Scope("tenant", "notes")
+    async with database.transaction():
+        evidence_id, first = await _seed(memory, scope)
+        second = await memory.propose(scope, evidence_id, _proposal(), idempotency_key="second")
+        await _seed(memory, Scope("tenant", "other"))
+        await _seed(memory, Scope("other", "notes"))
+        ids = sorted([first, second.id])
+        for query in (
+            partial(memory.list_candidates_by_state, scope, [GovernanceState.PROPOSED]),
+            partial(memory.list_candidates_by_evidence, scope, evidence_id),
+        ):
+            page = await query(limit=1)
+            assert [item.id for item in page] == ids[:1]
+            page = await query(after_id=page[0].id, limit=1)
+            assert [item.id for item in page] == ids[1:]
+            assert await query(after_id=page[0].id) == ()
+            with pytest.raises(ValueError, match="limit"):
+                await query(limit=1001)
+        assert await memory.list_candidates_by_state(scope, []) == ()
+        assert await memory.list_candidates_by_evidence(scope, "unknown") == ()
+    minimal = Memory(MinimalRecordStore(store), sink)
+    with pytest.raises(CapabilityUnavailable, match="CandidateQueryStore"):
+        await minimal.list_candidates_by_state(scope, [GovernanceState.PROPOSED])
+    with pytest.raises(CapabilityUnavailable, match="CandidateQueryStore"):
+        await minimal.list_candidates_by_evidence(scope, evidence_id)
+
+
+@pytest.mark.parametrize(
+    "operation", ["propose", "propose_many", "review", "apply", "supersede", "withdraw"]
+)
+async def test_corrupt_evidence_governance(operation: str) -> None:
+    database = InMemoryDatabase()
+    store = InMemoryRecordStore(database)
+    memory = Memory(store, InMemoryEventSink(database))
+    scope = Scope("tenant", "notes")
+
+    async with database.transaction():
+        evidence_id, candidate_id = await _seed(memory, scope)
+        _, old_id = await _seed(memory, scope, "-old")
+        if operation in {"apply", "supersede"}:
+            for key in (candidate_id, old_id):
+                await memory.review(
+                    scope,
+                    key,
+                    GovernanceState.ACCEPTED,
+                    "reviewer",
+                    "approved",
+                    expected_revision=1,
+                )
+        record = await store.get(scope, "evidence", evidence_id)
+        assert record is not None
+        await store.update(
+            scope,
+            "evidence",
+            evidence_id,
+            1,
+            {**record.payload, "revision": 2, "content": "Corrupted"},
+        )
+
+        if operation == "withdraw":
+            withdrawn = await memory.withdraw_evidence(
+                scope, evidence_id, "owner", "corruption", expected_revision=2
+            )
+            assert withdrawn.state.value == "withdrawn"
+            assert not await memory.verify_evidence(scope, evidence_id)
+            return
+
+        with pytest.raises(EvidenceIntegrityError, match="content_hash"):
+            if operation == "propose":
+                await memory.propose(scope, evidence_id, _proposal(), idempotency_key="new")
+            elif operation == "propose_many":
+                await memory.propose_many(scope, evidence_id, [(_proposal(), "new")])
+            elif operation == "review":
+                await memory.review(
+                    scope,
+                    candidate_id,
+                    GovernanceState.ACCEPTED,
+                    "reviewer",
+                    "approved",
+                    expected_revision=1,
+                )
+            elif operation == "apply":
+                await memory.record_application(
+                    scope,
+                    candidate_id,
+                    FormalRef("billing", "Policy", "policy-1", "v7"),
+                    "host",
+                    expected_revision=2,
+                )
+            else:
+                await memory.supersede(
+                    scope, old_id, candidate_id, "reviewer", "replacement", expected_revision=2
+                )
+
+
+async def test_filtered_candidate_queries_validate_before_capability() -> None:
+    database = InMemoryDatabase()
+    store = InMemoryRecordStore(database)
+    memory = Memory(MinimalRecordStore(store), InMemoryEventSink(database))
+    scope = Scope("tenant", "notes")
+    with pytest.raises(ValueError, match="GovernanceState"):
+        await memory.list_candidates_by_state(scope, ["accepted"])  # type: ignore[list-item]
+    with pytest.raises(ValueError):
+        await memory.list_candidates_by_evidence(scope, "")
+
+
+async def test_in_memory_candidate_query_rejects_string_states() -> None:
+    database = InMemoryDatabase()
+    store = InMemoryRecordStore(database)
+    with pytest.raises(ValueError, match="GovernanceState"):
+        async with database.transaction():
+            await store.list_candidates_by_state(
+                Scope("tenant", "notes"),
+                ["accepted"],  # type: ignore[list-item]
+                limit=1,
+            )

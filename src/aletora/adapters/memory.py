@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..errors import IdempotencyConflict, NotFound, RevisionConflict
-from ..models import Scope
+from ..models import GovernanceState, Scope, _governance_state_values
 from ..ports import EventSink, IndexEvent, InsertResult, RecordStore, StoredRecord
 
 _RecordKey = tuple[str, str, str, str]
@@ -122,8 +122,22 @@ class InMemoryRecordStore(RecordStore):
         after_id: str | None = None,
         limit: int = 100,
     ) -> tuple[StoredRecord, ...]:
+        return await self._list_records(scope, kind, after_id=after_id, limit=limit)
+
+    async def _list_records(
+        self,
+        scope: Scope,
+        kind: str,
+        *,
+        after_id: str | None,
+        limit: int,
+        field: str | None = None,
+        values: Sequence[str] = (),
+    ) -> tuple[StoredRecord, ...]:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
+        if field is not None and limit > 1000:
+            raise ValueError("limit must be an integer from 1 to 1000")
         transaction = self._database._require_transaction()
         matching = [
             stored
@@ -131,10 +145,45 @@ class InMemoryRecordStore(RecordStore):
             if tenant_id == scope.tenant_id
             and namespace == scope.namespace
             and rec_kind == kind
+            and (field is None or stored.payload.get(field) in values)
             and (after_id is None or record_id > after_id)
         ]
         matching.sort(key=lambda record: record.id)
         return tuple(deepcopy(record) for record in matching[:limit])
+
+    async def list_candidates_by_state(
+        self,
+        scope: Scope,
+        states: Sequence[GovernanceState],
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredRecord, ...]:
+        return await self._list_records(
+            scope,
+            "candidate",
+            after_id=after_id,
+            limit=limit,
+            field="state",
+            values=_governance_state_values(states),
+        )
+
+    async def list_candidates_by_evidence(
+        self,
+        scope: Scope,
+        evidence_id: str,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[StoredRecord, ...]:
+        return await self._list_records(
+            scope,
+            "candidate",
+            after_id=after_id,
+            limit=limit,
+            field="evidence_id",
+            values=(evidence_id,),
+        )
 
     async def insert(
         self,

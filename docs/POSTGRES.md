@@ -9,7 +9,8 @@ Aletora ships two optional adapters for its asynchronous `RecordStore` port:
   backend, never a pooled client or bare connection.
 
 Both adapters also implement `ShareLockableRecordStore` (`get_for_share`),
-`BatchRecordStore` (`get_many`), and `EnumerableRecordStore` (`list_records`).
+`BatchRecordStore` (`get_many`), `EnumerableRecordStore` (`list_records`), and
+`CandidateQueryStore` (filter by state or evidence ID).
 
 Install the relevant extra (`aletora[sqlalchemy]` or `aletora[tortoise]`). The
 adapters execute on the supplied host transaction; they never commit, roll
@@ -40,7 +41,10 @@ check uses Tortoise/asyncpg wrapper internals; it rejects wrappers that have not
 begun, have been finalized, or whose connection has been released, and raises
 `TypeError` for Tortoise's `psycopg` wrapper. If a future Tortoise version
 changes that wrapper shape, the adapter errors rather than falling back to a
-pooled/autocommit connection.
+pooled/autocommit connection. The extra requires Tortoise ORM >=0.24 and <0.26.
+The lockfile tests 0.25.4. Before widening the range, verify the wrapper shape,
+the asyncpg transaction-state probes, and rejection of missing or finalized wrappers
+against the real PostgreSQL transaction suite.
 
 ```python
 async with session_factory() as session:
@@ -75,6 +79,11 @@ and `render_migration`; pass `schema="..."` to qualify the table safely.
   empty settings mean no rows are visible and writes fail the policy's
   `WITH CHECK`. Both templates also enforce non-blank `CHECK` constraints (using the same whitespace set as Python's `str.strip()`) on
   `tenant_id`, `namespace`, `kind`, `record_id`, and `idempotency_key`.
+
+Both templates create partial expression indexes on candidate `state` and
+`evidence_id`, with tenant, namespace, and record ID in each index. PostgreSQL
+places each index in the table's schema. For an existing deployment, apply the
+two `CREATE INDEX` statements through your host migration process.
 
 RLS is defense in depth; every adapter query still scopes by tenant, namespace,
 kind, and record ID. Test shared-RLS behavior using a restricted role that is

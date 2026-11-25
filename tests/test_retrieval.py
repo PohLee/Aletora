@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from datetime import UTC, datetime
@@ -196,7 +197,9 @@ async def _pending_candidate(memory: Memory, scope: Scope, key: str):
 
 
 @pytest.mark.asyncio
-async def test_retrieval_returns_authorized_formal_content_and_provenance_only() -> None:
+async def test_retrieval_returns_authorized_formal_content_and_provenance_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     database = InMemoryDatabase()
     scope = Scope("tenant-a", "policies")
     memory = Memory(InMemoryRecordStore(database), InMemoryEventSink(database), clock=lambda: NOW)
@@ -215,6 +218,11 @@ async def test_retrieval_returns_authorized_formal_content_and_provenance_only()
         profile=PROFILE,
         clock=lambda: NOW,
     )
+
+    def unexpected_hash(*args: object, **kwargs: object) -> None:
+        pytest.fail("retrieval must not hash evidence content")
+
+    monkeypatch.setattr(hashlib, "sha256", unexpected_hash)
     async with database.transaction():
         results = await memory.retrieve(scope, "policy query", limit=1)
 
@@ -741,3 +749,32 @@ async def test_cancellation_during_resolution_closes_discovery() -> None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     assert index.closed == 1
+
+
+async def test_retrieval_observer_reports_success_and_isolates_failure(caplog) -> None:
+    from aletora import RetrievalStats
+
+    database = InMemoryDatabase()
+    calls: list[tuple[RetrievalStats, float]] = []
+
+    def observer(stats: RetrievalStats, elapsed: float) -> None:
+        calls.append((stats, elapsed))
+        raise RuntimeError("observer failure")
+
+    memory = Memory(
+        InMemoryRecordStore(database),
+        InMemoryEventSink(database),
+        index=FakeIndex([]),
+        resolver=FakeResolver({}),
+        profile=PROFILE,
+        on_retrieval=observer,
+    )
+    scope = Scope("tenant", "notes")
+    async with database.transaction():
+        result = await memory.retrieve_with_stats(scope, "query", limit=1)
+        assert await memory.retrieve(scope, "query", limit=1) == result.hits
+        with pytest.raises(ValueError):
+            await memory.retrieve(scope, "", limit=1)
+    assert len(calls) == 2
+    assert all(stats == result.stats and elapsed >= 0 for stats, elapsed in calls)
+    assert caplog.text.count("Retrieval observer failed") == 2

@@ -5,6 +5,14 @@ class AletoraError(Exception):
     """Base class for expected Aletora failures."""
 
 
+class EvidenceIntegrityError(AletoraError, ValueError):
+    """Stored evidence content does not match its recorded digest."""
+
+
+class EvidenceTooLarge(AletoraError):
+    """Evidence exceeds the configured UTF-8 byte limit."""
+
+
 class NotFound(AletoraError):
     """A scoped record does not exist or is not visible."""
 

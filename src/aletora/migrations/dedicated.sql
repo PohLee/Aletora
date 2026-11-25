@@ -12,3 +12,11 @@ CREATE TABLE {{table}} (
     CONSTRAINT aletora_records_idempotency_key
         UNIQUE (tenant_id, namespace, kind, idempotency_key)
 );
+
+CREATE INDEX aletora_candidates_state_idx ON {{table}}
+    (tenant_id, namespace, (payload->>'state'), record_id)
+    WHERE kind = 'candidate';
+
+CREATE INDEX aletora_candidates_evidence_id_idx ON {{table}}
+    (tenant_id, namespace, (payload->>'evidence_id'), record_id)
+    WHERE kind = 'candidate';
